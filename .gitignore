@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+
+# The canonical working set (see CLAUDE.md: "working/<UDID>/ is canonical").
+# It holds live device backup data and must never be committed.
+/working/
+
+.DS_Store

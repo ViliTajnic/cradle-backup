@@ -1,0 +1,18 @@
+[package]
+name = "cradle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backup and restore for iPhone and iPad — free tier CLI."
+
+[[bin]]
+name = "cradle"
+path = "src/main.rs"
+
+[dependencies]
+cradle-core = { path = "../cradle-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

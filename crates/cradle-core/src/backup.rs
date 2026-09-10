@@ -1,0 +1,190 @@
+//! Runs a `mobilebackup2` backup into the canonical working directory.
+//!
+//! Per CLAUDE.md, `working/<UDID>/` is canonical: it stays exactly in the
+//! state the device left it, because MobileBackup2 computes incrementals
+//! *on the device* by inspecting `Status.plist` / `Manifest.plist` /
+//! `Manifest.db` already sitting there. This module never moves, archives,
+//! or otherwise touches that directory beyond what the protocol itself
+//! writes into it.
+
+use std::future::Future;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+
+use idevice::{
+    IdeviceError, IdeviceService,
+    mobilebackup2::{BackupDelegate, DirEntryInfo, FsBackupDelegate, MobileBackup2Client},
+    provider::IdeviceProvider,
+};
+
+use crate::CradleError;
+
+/// Receives honest, measurable progress during a backup.
+///
+/// Per CLAUDE.md: "Every long-running operation reports files done/total,
+/// bytes, rate, ETA, and current domain. Never ship an indeterminate spinner
+/// for an operation whose progress we can measure." Implementations should
+/// be cheap — these are called for every file and every progress tick.
+pub trait ProgressSink: Send + Sync {
+    /// `bytes_total` is 0 when the device hasn't reported a batch size yet.
+    /// `overall_progress` is the device's own 0.0-100.0 estimate, or
+    /// negative when it hasn't reported one.
+    fn on_progress(&self, bytes_done: u64, bytes_total: u64, overall_progress: f64);
+    fn on_file(&self, path: &str, file_count: u32);
+}
+
+/// A [`ProgressSink`] that discards everything. Useful for callers (tests,
+/// library embedders) that don't need progress output.
+pub struct NullProgress;
+
+impl ProgressSink for NullProgress {
+    fn on_progress(&self, _bytes_done: u64, _bytes_total: u64, _overall_progress: f64) {}
+    fn on_file(&self, _path: &str, _file_count: u32) {}
+}
+
+/// The outcome of a completed backup run.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub udid: String,
+    pub backup_dir: PathBuf,
+}
+
+/// [`BackupDelegate`] that stores to the local filesystem — via the crate's
+/// own [`FsBackupDelegate`] — while forwarding progress to a
+/// [`ProgressSink`].
+///
+/// This is the seam CLAUDE.md calls out: "backup to anywhere" lives in
+/// alternate `BackupDelegate` implementations, not a copy step bolted on
+/// afterwards. A future destination-aware delegate replaces `fs` here
+/// without touching anything in this file.
+struct CradleDelegate {
+    fs: FsBackupDelegate,
+    progress: Arc<dyn ProgressSink>,
+}
+
+impl BackupDelegate for CradleDelegate {
+    fn get_free_disk_space(&self, path: &Path) -> u64 {
+        self.fs.get_free_disk_space(path)
+    }
+
+    fn open_file_read<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Read + Send>, IdeviceError>> + Send + 'a>> {
+        self.fs.open_file_read(path)
+    }
+
+    fn create_file_write<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Write + Send>, IdeviceError>> + Send + 'a>> {
+        self.fs.create_file_write(path)
+    }
+
+    fn create_dir_all<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + 'a>> {
+        self.fs.create_dir_all(path)
+    }
+
+    fn remove<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + 'a>> {
+        self.fs.remove(path)
+    }
+
+    fn rename<'a>(
+        &'a self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + 'a>> {
+        self.fs.rename(from, to)
+    }
+
+    fn copy<'a>(
+        &'a self,
+        src: &'a Path,
+        dst: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + 'a>> {
+        self.fs.copy(src, dst)
+    }
+
+    fn exists<'a>(&'a self, path: &'a Path) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        self.fs.exists(path)
+    }
+
+    fn is_dir<'a>(&'a self, path: &'a Path) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        self.fs.is_dir(path)
+    }
+
+    fn list_dir<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DirEntryInfo>, IdeviceError>> + Send + 'a>> {
+        self.fs.list_dir(path)
+    }
+
+    fn on_file_received(&self, path: &str, file_count: u32) {
+        self.progress.on_file(path, file_count);
+    }
+
+    fn on_progress(&self, bytes_done: u64, bytes_total: u64, overall_progress: f64) {
+        self.progress
+            .on_progress(bytes_done, bytes_total, overall_progress);
+    }
+}
+
+/// Backs up the device behind `provider` into `working_root/<UDID>/`.
+///
+/// `working_root` must be the canonical working directory — never a network
+/// mount, never an archived snapshot. The device relies on finding its own
+/// prior `Status.plist` / `Manifest.plist` / `Manifest.db` here on the next
+/// run to compute an incremental; deleting or relocating this directory
+/// between runs forces a full transfer.
+pub async fn run(
+    provider: &dyn IdeviceProvider,
+    working_root: &Path,
+    force_full: bool,
+    progress: Arc<dyn ProgressSink>,
+) -> Result<Outcome, CradleError> {
+    let mut client = MobileBackup2Client::connect(provider).await?;
+    let udid = client
+        .idevice
+        .udid()
+        .map(|s| s.to_string())
+        .ok_or(CradleError::MissingUdid)?;
+
+    tokio::fs::create_dir_all(working_root).await?;
+
+    let options = force_full.then(|| {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("ForceFullBackup".to_string(), plist::Value::Boolean(true));
+        dict
+    });
+
+    let delegate = CradleDelegate {
+        fs: FsBackupDelegate,
+        progress,
+    };
+
+    let response = client
+        .backup_from_path(working_root, None, options, &delegate)
+        .await?;
+
+    if let Some(dict) = &response {
+        if let Some(code) = dict.get("ErrorCode") {
+            return Err(CradleError::Other(format!(
+                "device reported a backup error: {code:?}"
+            )));
+        }
+    }
+
+    Ok(Outcome {
+        backup_dir: working_root.join(&udid),
+        udid,
+    })
+}
