@@ -6,19 +6,26 @@ real progress instead of an indeterminate spinner.
 
 See [`CLAUDE.md`](./CLAUDE.md) for the project's non-negotiables and
 architecture, and [`ROADMAP.md`](./ROADMAP.md) for the milestone plan. This
-repo is at **M0** — protocol spike, unverified against real hardware.
+repo is at **M1** — protocol spike + verification gate, unverified against
+real hardware.
 
 ## Status
 
-M0 is scaffolded but has never been run against a real device. Per
-`ROADMAP.md`, every milestone must be green against real hardware before the
-next one starts — expect small fixes on first real run.
+M0 and M1 are scaffolded but have never been run against a real device or
+compiled (no Rust toolchain / device available in the environment this was
+written in). Per `ROADMAP.md`, every milestone must be green against real
+hardware before the next one starts — expect small fixes on first real run.
+
+M1's verification gate is intentionally reduced-scope until M5's crypto
+layer exists: see the doc comment at the top of
+`crates/cradle-core/src/verify.rs` for what's checked now versus what
+`CLAUDE.md` specifies.
 
 ## Layout
 
-- `crates/cradle-core` — device discovery, prechecks, and the
-  `mobilebackup2` backup path. No UI, no database, no destinations (those
-  are later milestones).
+- `crates/cradle-core` — device discovery, prechecks, the `mobilebackup2`
+  backup path, and the post-backup verification gate. No UI, no database,
+  no destinations (those are later milestones).
 - `crates/cradle-cli` — the `cradle` binary: `cradle devices`,
   `cradle backup`.
 
