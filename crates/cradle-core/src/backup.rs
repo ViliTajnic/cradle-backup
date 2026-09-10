@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use idevice::{
     IdeviceError, IdeviceService,
@@ -49,6 +50,12 @@ impl ProgressSink for NullProgress {
 pub struct Outcome {
     pub udid: String,
     pub backup_dir: PathBuf,
+    /// Number of files the device reported sending this run. Fed into
+    /// [`crate::verify`] as the count to check on-disk files against —
+    /// counting `on_file_received` calls rather than trusting any single
+    /// `file_count` value it carries, since that value resets per upload
+    /// batch and a backup can involve several batches.
+    pub files_received: u64,
 }
 
 /// [`BackupDelegate`] that stores to the local filesystem — via the crate's
@@ -62,6 +69,7 @@ pub struct Outcome {
 struct CradleDelegate {
     fs: FsBackupDelegate,
     progress: Arc<dyn ProgressSink>,
+    files_received: AtomicU64,
 }
 
 impl BackupDelegate for CradleDelegate {
@@ -129,6 +137,10 @@ impl BackupDelegate for CradleDelegate {
     }
 
     fn on_file_received(&self, path: &str, file_count: u32) {
+        // Count events, not the `file_count` value: it's a running total
+        // within the *current* upload batch, and a backup can involve
+        // several batches, each restarting that count from zero.
+        self.files_received.fetch_add(1, Ordering::Relaxed);
         self.progress.on_file(path, file_count);
     }
 
@@ -169,6 +181,7 @@ pub async fn run(
     let delegate = CradleDelegate {
         fs: FsBackupDelegate,
         progress,
+        files_received: AtomicU64::new(0),
     };
 
     let response = client
@@ -186,5 +199,6 @@ pub async fn run(
     Ok(Outcome {
         backup_dir: working_root.join(&udid),
         udid,
+        files_received: delegate.files_received.load(Ordering::Relaxed),
     })
 }

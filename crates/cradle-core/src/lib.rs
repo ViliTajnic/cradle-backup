@@ -8,6 +8,7 @@
 pub mod backup;
 pub mod device;
 pub mod precheck;
+pub mod verify;
 
 /// Errors that can occur anywhere in the Cradle core: device protocol
 /// failures, local filesystem failures, or a handful of Cradle-specific

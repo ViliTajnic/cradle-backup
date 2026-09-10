@@ -1,4 +1,4 @@
-//! Cradle CLI — M0: connect, precheck, back up with a real progress line.
+//! Cradle CLI — M0 connect/precheck/backup, M1 verification gate.
 //!
 //! Per CLAUDE.md, the CLI is not a debug tool: it ships, it is supported,
 //! and it is the free tier's complete interface.
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use cradle_core::{backup, device, precheck};
+use cradle_core::{backup, device, precheck, verify};
 
 use progress::{TerminalProgress, human_bytes};
 
@@ -102,21 +102,21 @@ async fn run_backup(udid: Option<String>, working_root: PathBuf, full: bool) -> 
     let provider = device::provider_for(&udid).await?;
 
     println!("Running prechecks...");
-    let report = precheck::run(&*provider, &working_root).await?;
+    let precheck_report = precheck::run(&*provider, &working_root).await?;
 
-    if let Some(info) = &report.device {
+    if let Some(info) = &precheck_report.device {
         println!(
             "Device: {} ({}, iOS {})",
             info.name, info.product_type, info.ios_version
         );
     }
 
-    if !report.pairing_valid {
-        anyhow::bail!(report
+    if !precheck_report.pairing_valid {
+        anyhow::bail!(precheck_report
             .pairing_message
             .unwrap_or_else(|| "Pairing check failed.".to_string()));
     }
-    if !report.encryption_enabled {
+    if !precheck_report.encryption_enabled {
         anyhow::bail!(
             "Backup encryption is off on this device. Enable it under Settings > General > \
              Transfer or Reset iPhone > Encrypted Backup (or via Finder) before continuing — \
@@ -124,10 +124,10 @@ async fn run_backup(udid: Option<String>, working_root: PathBuf, full: bool) -> 
              omitted from the backup."
         );
     }
-    if !report.free_space_ok {
+    if !precheck_report.free_space_ok {
         anyhow::bail!(
             "Only {} free on the working volume; want at least {} before starting a backup.",
-            human_bytes(report.free_space_bytes),
+            human_bytes(precheck_report.free_space_bytes),
             human_bytes(precheck::MIN_FREE_BYTES),
         );
     }
@@ -138,6 +138,41 @@ async fn run_backup(udid: Option<String>, working_root: PathBuf, full: bool) -> 
     let outcome = backup::run(&*provider, &working_root, full, progress.clone()).await?;
     progress.finish();
 
-    println!("Backup complete: {}", outcome.backup_dir.display());
+    println!("Verifying backup...");
+    let gate = verify::run(&outcome.backup_dir, outcome.files_received).await?;
+
+    if !gate.passed() {
+        let mut problems = Vec::new();
+        if !gate.status_finished {
+            problems.push(
+                "Status.plist does not report a finished snapshot — the device may have \
+                 cancelled or the transfer was interrupted."
+                    .to_string(),
+            );
+        }
+        if !gate.manifest_present {
+            problems.push(
+                "Manifest.db is missing, empty, or truncated — it did not arrive intact."
+                    .to_string(),
+            );
+        }
+        if !gate.file_count_match {
+            problems.push(format!(
+                "File count mismatch: {} files on disk vs. {} the device reported sending.",
+                gate.files_on_disk, gate.files_reported
+            ));
+        }
+        anyhow::bail!(
+            "Backup did not pass verification — treat {} as failed, not a usable snapshot:\n{}",
+            outcome.backup_dir.display(),
+            problems.join("\n"),
+        );
+    }
+
+    println!(
+        "Backup verified: {} ({} files).",
+        outcome.backup_dir.display(),
+        gate.files_on_disk
+    );
     Ok(())
 }
