@@ -156,6 +156,20 @@ impl BackupDelegate for CradleDelegate {
 /// not worth a specific hint yet — the raw code is still shown to the user.
 fn device_error_hint(code: i64) -> Option<&'static str> {
     match code {
+        100 => Some(
+            "couldn't export a Keychain/encryption key needed for the backup — retry, and if \
+             it keeps happening, disable and re-enable encrypted backups in Finder (Change \
+             Password) to reset the keybag",
+        ),
+        105 => Some(
+            "not enough free space on this Mac to store the backup (the device checks this \
+             itself before sending data) — free up space, or point --working-dir at a volume \
+             with more room",
+        ),
+        106 => Some(
+            "not enough free space on the device itself to prepare its backup — free up space \
+             on the iPhone/iPad and retry",
+        ),
         207 => Some(
             "invalid or missing backup password — set/confirm the encrypted backup password \
              in Finder (General > Transfer or Reset > Change Password), then retry",
