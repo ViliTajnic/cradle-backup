@@ -150,6 +150,29 @@ impl BackupDelegate for CradleDelegate {
     }
 }
 
+/// Names the fix for the `MBErrorDomain` codes the device most commonly
+/// reports in a `DLMessageProcessMessage` final response, per CLAUDE.md's
+/// "error messages name the fix, not the symptom" rule. `None` for anything
+/// not worth a specific hint yet — the raw code is still shown to the user.
+fn device_error_hint(code: i64) -> Option<&'static str> {
+    match code {
+        207 => Some(
+            "invalid or missing backup password — set/confirm the encrypted backup password \
+             in Finder (General > Transfer or Reset > Change Password), then retry",
+        ),
+        208 => Some(
+            "the device was locked when iOS needed to access protected data — unlock it with \
+             its passcode and keep it unlocked and awake for the whole backup, then retry",
+        ),
+        209 => Some(
+            "the device couldn't find the encryption key for one of its files — retry with \
+             --full to force a fresh backup",
+        ),
+        211 => Some("Find My is enabled on the target device — disable it before restoring"),
+        _ => None,
+    }
+}
+
 /// Backs up the device behind `provider` into `working_root/<UDID>/`.
 ///
 /// `working_root` must be the canonical working directory — never a network
@@ -190,9 +213,14 @@ pub async fn run(
 
     if let Some(dict) = &response {
         if let Some(code) = dict.get("ErrorCode") {
-            return Err(CradleError::Other(format!(
-                "device reported a backup error: {code:?}"
-            )));
+            let number = code.as_signed_integer();
+            let hint = number.and_then(device_error_hint);
+            let message = match (number, hint) {
+                (Some(n), Some(hint)) => format!("device backup error {n}: {hint}"),
+                (Some(n), None) => format!("device reported backup error {n}"),
+                (None, _) => format!("device reported a backup error: {code:?}"),
+            };
+            return Err(CradleError::Other(message));
         }
     }
 

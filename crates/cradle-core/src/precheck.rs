@@ -6,7 +6,11 @@
 
 use std::path::Path;
 
-use idevice::{IdeviceError, mobilebackup2::FsBackupDelegate, provider::IdeviceProvider};
+use idevice::{
+    IdeviceError,
+    mobilebackup2::{BackupDelegate, FsBackupDelegate},
+    provider::IdeviceProvider,
+};
 
 use crate::CradleError;
 use crate::device::{self, DeviceInfo};

@@ -25,7 +25,7 @@
 //! Both checks should be swapped for the literal spec once M5 exists —
 //! search for `M5` in this file.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::CradleError;
 
@@ -158,6 +158,7 @@ fn count_files(backup_dir: &Path) -> Result<u64, CradleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn count_files_is_zero_for_missing_directory() {
