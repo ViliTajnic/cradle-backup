@@ -77,6 +77,12 @@ pub struct Outcome {
     /// `file_count` value it carries, since that value resets per upload
     /// batch and a backup can involve several batches.
     pub files_received: u64,
+    /// Bytes actually moved over the wire this run — summed across upload
+    /// batches, not the on-disk size of the resulting snapshot (an
+    /// incremental run typically moves far less than the snapshot is
+    /// large, since most files were already there). Feeds
+    /// `catalog::Catalog::finish_run`'s `bytes` column.
+    pub bytes_transferred: u64,
 }
 
 /// [`BackupDelegate`] that stores to the local filesystem — via the crate's
@@ -91,6 +97,11 @@ struct CradleDelegate {
     fs: FsBackupDelegate,
     progress: Arc<dyn ProgressSink>,
     files_received: AtomicU64,
+    bytes_transferred: AtomicU64,
+    /// `bytes_done` from the most recent `on_progress` call, to turn its
+    /// per-batch running total into a whole-run delta sum (see
+    /// `on_progress` below).
+    last_batch_bytes: AtomicU64,
 }
 
 impl BackupDelegate for CradleDelegate {
@@ -166,6 +177,17 @@ impl BackupDelegate for CradleDelegate {
     }
 
     fn on_progress(&self, bytes_done: u64, bytes_total: u64, overall_progress: f64) {
+        // `bytes_done` is a running total *within the current batch*, per
+        // the trait's own doc comment — same batching gotcha as file_count
+        // above. Turn it into a whole-run total by summing deltas, treating
+        // a drop (a new batch starting) as a fresh delta from 0.
+        let previous = self.last_batch_bytes.swap(bytes_done, Ordering::Relaxed);
+        let delta = if bytes_done >= previous {
+            bytes_done - previous
+        } else {
+            bytes_done
+        };
+        self.bytes_transferred.fetch_add(delta, Ordering::Relaxed);
         self.progress
             .on_progress(bytes_done, bytes_total, overall_progress);
     }
@@ -272,6 +294,8 @@ pub async fn run(
         fs: FsBackupDelegate,
         progress: progress.clone(),
         files_received: AtomicU64::new(0),
+        bytes_transferred: AtomicU64::new(0),
+        last_batch_bytes: AtomicU64::new(0),
     };
 
     // Best-effort: a device that refuses this second connection still gets
@@ -291,26 +315,27 @@ pub async fn run(
         None => backup.await,
     }?;
 
-    if let Some(dict) = &response {
-        if let Some(code) = dict.get("ErrorCode") {
-            let number = code.as_signed_integer();
-            if number == Some(208) {
-                return Err(CradleError::DeviceLocked);
-            }
-            let hint = number.and_then(device_error_hint);
-            let message = match (number, hint) {
-                (Some(n), Some(hint)) => format!("device backup error {n}: {hint}"),
-                (Some(n), None) => format!("device reported backup error {n}"),
-                (None, _) => format!("device reported a backup error: {code:?}"),
-            };
-            return Err(CradleError::Other(message));
+    if let Some(dict) = &response
+        && let Some(code) = dict.get("ErrorCode")
+    {
+        let number = code.as_signed_integer();
+        if number == Some(208) {
+            return Err(CradleError::DeviceLocked);
         }
+        let hint = number.and_then(device_error_hint);
+        let message = match (number, hint) {
+            (Some(n), Some(hint)) => format!("device backup error {n}: {hint}"),
+            (Some(n), None) => format!("device reported backup error {n}"),
+            (None, _) => format!("device reported a backup error: {code:?}"),
+        };
+        return Err(CradleError::Other(message));
     }
 
     Ok(Outcome {
         backup_dir: working_root.join(&udid),
         udid,
         files_received: delegate.files_received.load(Ordering::Relaxed),
+        bytes_transferred: delegate.bytes_transferred.load(Ordering::Relaxed),
     })
 }
 

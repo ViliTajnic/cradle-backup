@@ -1,11 +1,14 @@
-//! Device protocol, prechecks and backup orchestration for Cradle.
+//! Device protocol, prechecks, backup orchestration and the catalog for
+//! Cradle.
 //!
-//! M0 scope only (see `/ROADMAP.md`): connect to a device over `mobilebackup2`,
-//! run prechecks, and perform a backup into the canonical working directory
-//! with honest progress reporting. No catalog, no archiving, no restore yet —
-//! those land in later milestones and must not be built ahead of schedule.
+//! M0-M2 scope only (see `/ROADMAP.md`): connect to a device over
+//! `mobilebackup2`, run prechecks, perform a backup into the canonical
+//! working directory with honest progress reporting, verify it, and record
+//! it in a small local catalog. No archiving, no restore yet — those land
+//! in later milestones and must not be built ahead of schedule.
 
 pub mod backup;
+pub mod catalog;
 pub mod device;
 pub mod precheck;
 pub mod verify;
@@ -23,6 +26,9 @@ pub enum CradleError {
 
     #[error("device did not report a UDID")]
     MissingUdid,
+
+    #[error("catalog error: {0}")]
+    Catalog(#[from] rusqlite::Error),
 
     /// MBErrorDomain 208. Split out from [`Self::Other`] because it's
     /// recoverable: see [`backup::run_resilient`], which retries on exactly

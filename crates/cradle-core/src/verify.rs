@@ -40,6 +40,12 @@ pub struct Report {
     pub files_on_disk: u64,
     pub files_reported: u64,
     pub file_count_match: bool,
+    /// Total bytes of every file under `backup_dir`, from the same walk
+    /// that produced `files_on_disk`. This is the on-disk size of the
+    /// *snapshot*, not bytes transferred this run — an incremental run
+    /// moves far less than this over the wire. Feeds
+    /// `catalog::Catalog::record_snapshot`'s `size` column.
+    pub total_bytes: u64,
 }
 
 impl Report {
@@ -65,7 +71,7 @@ fn run_blocking(backup_dir: &Path, files_reported: u64) -> Result<Report, Cradle
     let status_finished = status_finished(backup_dir);
     let encrypted = backup_is_encrypted(backup_dir);
     let manifest_present = manifest_db_present(backup_dir, encrypted);
-    let files_on_disk = count_files(backup_dir)?;
+    let (files_on_disk, total_bytes) = scan_backup_dir(backup_dir)?;
     let file_count_match = files_on_disk == files_reported;
 
     Ok(Report {
@@ -74,6 +80,7 @@ fn run_blocking(backup_dir: &Path, files_reported: u64) -> Result<Report, Cradle
         files_on_disk,
         files_reported,
         file_count_match,
+        total_bytes,
     })
 }
 
@@ -124,15 +131,19 @@ fn manifest_db_present(backup_dir: &Path, encrypted: bool) -> bool {
 }
 
 /// Check 3 (reduced scope — see module docs): counts every regular file
-/// under `backup_dir`, recursively.
+/// under `backup_dir`, recursively, and sums their sizes along the way —
+/// one walk serving both the file-count check and the catalog's snapshot
+/// size, rather than walking the tree twice.
 ///
 /// # M5
-/// Replace with `SELECT COUNT(*) FROM Files` against the decrypted
-/// `Manifest.db`, which is the device's own authoritative record — this
-/// walk only proves our delegate persisted everything it was told about,
-/// not that the device's manifest agrees.
-fn count_files(backup_dir: &Path) -> Result<u64, CradleError> {
-    let mut total = 0u64;
+/// Replace the count with `SELECT COUNT(*) FROM Files` against the
+/// decrypted `Manifest.db`, which is the device's own authoritative
+/// record — this walk only proves our delegate persisted everything it
+/// was told about, not that the device's manifest agrees. The byte total
+/// can stay a disk walk even then; nothing in the manifest replaces it.
+fn scan_backup_dir(backup_dir: &Path) -> Result<(u64, u64), CradleError> {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
     let mut stack = vec![backup_dir.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
@@ -147,12 +158,13 @@ fn count_files(backup_dir: &Path) -> Result<u64, CradleError> {
             if file_type.is_dir() {
                 stack.push(entry.path());
             } else if file_type.is_file() {
-                total += 1;
+                files += 1;
+                bytes += entry.metadata()?.len();
             }
         }
     }
 
-    Ok(total)
+    Ok((files, bytes))
 }
 
 #[cfg(test)]
@@ -161,8 +173,8 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn count_files_is_zero_for_missing_directory() {
+    fn scan_is_zero_for_missing_directory() {
         let missing = PathBuf::from("/does/not/exist/cradle-test");
-        assert_eq!(count_files(&missing).unwrap(), 0);
+        assert_eq!(scan_backup_dir(&missing).unwrap(), (0, 0));
     }
 }
