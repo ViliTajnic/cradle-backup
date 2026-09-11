@@ -15,6 +15,9 @@ pub fn run() {
             commands::list_devices,
             commands::run_backup,
             commands::get_history,
+            commands::list_destinations,
+            commands::add_destination,
+            commands::run_archive,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Cradle app");

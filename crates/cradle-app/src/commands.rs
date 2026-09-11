@@ -15,8 +15,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cradle_core::catalog::{Catalog, DeviceRecord, RunKind, RunStatus};
-use cradle_core::{backup, device, keychain, precheck, verify};
+use cradle_core::catalog::{ArchiveState, Catalog, DestinationRecord, DeviceRecord, RunKind, RunStatus};
+use cradle_core::{archive, backup, device, keychain, precheck, verify};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
@@ -158,7 +158,7 @@ pub async fn run_backup(app: AppHandle, udid: String) -> Result<BackupSummary, S
         .start_run(&udid, RunKind::Backup)
         .map_err(|e| e.to_string())?;
 
-    let progress = Arc::new(TauriProgress::new(app.clone()));
+    let progress = Arc::new(TauriProgress::for_backup(app.clone()));
     let retry_app = app.clone();
     let attempt = backup::run_resilient(&*provider, &working_root, false, progress, move |attempt, max| {
         let _ = retry_app.emit(
@@ -292,4 +292,131 @@ pub async fn get_history(udid: String) -> Result<Vec<HistoryEntry>, String> {
             error: r.error,
         })
         .collect())
+}
+
+#[derive(Serialize, Clone)]
+pub struct DestinationEntry {
+    name: String,
+    kind: String,
+    uri: String,
+}
+
+/// Lists configured archive destinations — mirrors `cradle destination
+/// list`.
+#[tauri::command]
+pub async fn list_destinations() -> Result<Vec<DestinationEntry>, String> {
+    let catalog = open_catalog()?;
+    let destinations = catalog.list_destinations().map_err(|e| e.to_string())?;
+    Ok(destinations
+        .into_iter()
+        .map(|d| DestinationEntry {
+            name: d.name,
+            kind: d.kind,
+            uri: d.uri,
+        })
+        .collect())
+}
+
+/// Registers a new archive destination and initializes its repository —
+/// mirrors `cradle destination add`. `uri` is any restic-compatible
+/// repository location (a local path, `sftp:`, `s3:`, `b2:`, ...).
+#[tauri::command]
+pub async fn add_destination(name: String, kind: String, uri: String) -> Result<(), String> {
+    let catalog = open_catalog()?;
+    if catalog
+        .destination_by_name(&name)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Err(format!("A destination named '{name}' already exists."));
+    }
+
+    let credential_ref = keychain::destination_account(&name);
+    keychain::generate_and_store(&credential_ref).map_err(|e| e.to_string())?;
+
+    // Probe with a throwaway record (id doesn't matter — archive::
+    // only reads uri/credential_ref) so init runs *before* the catalog
+    // insert: if it fails, nothing gets recorded at all. Same ordering
+    // as cradle-cli's `destination add` and for the same reason.
+    let probe = DestinationRecord {
+        id: 0,
+        name: name.clone(),
+        kind: kind.clone(),
+        uri: uri.clone(),
+        credential_ref: credential_ref.clone(),
+        retention_json: None,
+    };
+    if let Err(e) = archive::ensure_initialized(&probe).await {
+        let _ = keychain::delete(&credential_ref);
+        return Err(e.to_string());
+    }
+
+    catalog
+        .create_destination(&name, &kind, &uri, &credential_ref)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Serialize, Clone)]
+pub struct ArchiveSummary {
+    snapshot_id: String,
+    data_added: u64,
+    total_bytes_processed: u64,
+    total_files_processed: u64,
+}
+
+/// Archives the latest verified snapshot for `udid` to `destination` —
+/// mirrors `cradle archive run`. Progress streams as
+/// [`crate::progress::ARCHIVE_PROGRESS_EVENT`] events, same pattern as
+/// [`run_backup`].
+#[tauri::command]
+pub async fn run_archive(app: AppHandle, udid: String, destination: String) -> Result<ArchiveSummary, String> {
+    let working_root = default_working_dir();
+    let catalog = open_catalog()?;
+
+    let destination_record = catalog
+        .destination_by_name(&destination)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("No destination named '{destination}'."))?;
+
+    let snapshot = catalog
+        .latest_verified_snapshot(&udid)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!("No verified snapshot for {udid} yet — back it up first.")
+        })?;
+
+    let source_dir = working_root.join(&udid);
+    if !source_dir.is_dir() {
+        return Err(format!(
+            "Backup directory {} not found — was it moved since the last backup?",
+            source_dir.display()
+        ));
+    }
+
+    archive::ensure_initialized(&destination_record)
+        .await
+        .map_err(|e| e.to_string())?;
+    let archive_id = catalog
+        .start_archive(snapshot.id, destination_record.id)
+        .map_err(|e| e.to_string())?;
+
+    let progress = Arc::new(TauriProgress::for_archive(app));
+    match archive::backup(&destination_record, &source_dir, progress).await {
+        Ok(summary) => {
+            catalog
+                .finish_archive(archive_id, ArchiveState::Succeeded, Some(&summary.snapshot_id), None)
+                .map_err(|e| e.to_string())?;
+            Ok(ArchiveSummary {
+                snapshot_id: summary.snapshot_id,
+                data_added: summary.data_added,
+                total_bytes_processed: summary.total_bytes_processed,
+                total_files_processed: summary.total_files_processed,
+            })
+        }
+        Err(e) => {
+            let _ = catalog.finish_archive(archive_id, ArchiveState::Failed, None, Some(&e.to_string()));
+            Err(e.to_string())
+        }
+    }
 }

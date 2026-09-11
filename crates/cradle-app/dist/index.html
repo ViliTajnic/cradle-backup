@@ -181,6 +181,45 @@
       <div id="backup-result"></div>
     </section>
 
+    <section class="panel" id="archive-panel" style="display:none;">
+      <h2>Archive — <span id="archive-device-name"></span></h2>
+      <div class="progress-track"><div id="archive-progress-fill" class="progress-fill"></div></div>
+      <div class="stat-grid">
+        <div class="stat"><div id="archive-stat-pct" class="value">—</div><div class="label">Progress</div></div>
+        <div class="stat"><div id="archive-stat-files" class="value">0</div><div class="label">Files</div></div>
+        <div class="stat"><div id="archive-stat-rate" class="value">—</div><div class="label">Rate</div></div>
+        <div class="stat"><div id="archive-stat-eta" class="value">—</div><div class="label">ETA</div></div>
+      </div>
+      <div id="archive-status" class="status-line"></div>
+      <div id="archive-result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Destinations</h2>
+      <div id="destinations" class="empty">No destinations configured yet.</div>
+      <form id="add-destination-form" style="margin-top:14px; display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap;">
+        <div>
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">Name</label>
+          <input id="dest-name" required style="font:inherit; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--text); width:120px;" placeholder="nas" />
+        </div>
+        <div>
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">Kind</label>
+          <select id="dest-kind" style="font:inherit; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--text);">
+            <option value="local">local</option>
+            <option value="nas">nas</option>
+            <option value="s3">s3</option>
+            <option value="b2">b2</option>
+          </select>
+        </div>
+        <div style="flex:1; min-width:220px;">
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">URI (local path, sftp:, s3:, b2:…)</label>
+          <input id="dest-uri" required style="font:inherit; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--text); width:100%;" placeholder="/Volumes/backups/cradle-repo" />
+        </div>
+        <button type="submit" class="primary">Add destination</button>
+      </form>
+      <div id="dest-form-error" class="result bad" style="display:none; margin-top:10px;"></div>
+    </section>
+
     <section class="panel">
       <h2>History — <span id="history-device-name">select a device</span></h2>
       <div id="history" class="empty">No device selected.</div>
@@ -194,6 +233,9 @@ const { listen } = window.__TAURI__.event;
 
 let selectedUdid = null;
 let backupStart = null;
+let archiveStart = null;
+let knownDestinations = [];
+let lastDevices = [];
 
 function humanBytes(bytes) {
   if (bytes == null) return "—";
@@ -254,6 +296,34 @@ function renderDevices(devices) {
     btn.onclick = () => startBackup(d);
     right.appendChild(btn);
 
+    const destSelect = document.createElement("select");
+    destSelect.style.font = "inherit";
+    destSelect.style.padding = "6px 8px";
+    destSelect.style.border = "1px solid var(--border)";
+    destSelect.style.borderRadius = "6px";
+    destSelect.style.background = "var(--panel)";
+    destSelect.style.color = "var(--text)";
+    if (!knownDestinations.length) {
+      const opt = document.createElement("option");
+      opt.textContent = "No destinations";
+      destSelect.appendChild(opt);
+      destSelect.disabled = true;
+    } else {
+      for (const dest of knownDestinations) {
+        const opt = document.createElement("option");
+        opt.value = dest.name;
+        opt.textContent = dest.name;
+        destSelect.appendChild(opt);
+      }
+    }
+    right.appendChild(destSelect);
+
+    const archiveBtn = document.createElement("button");
+    archiveBtn.textContent = "Archive";
+    archiveBtn.disabled = !knownDestinations.length;
+    archiveBtn.onclick = () => startArchive(d, destSelect.value);
+    right.appendChild(archiveBtn);
+
     const histBtn = document.createElement("button");
     histBtn.textContent = "History";
     histBtn.onclick = () => showHistory(d);
@@ -270,11 +340,91 @@ async function refreshDevices() {
   btn.disabled = true;
   try {
     const devices = await invoke("list_devices");
+    lastDevices = devices;
     renderDevices(devices);
   } catch (e) {
     document.getElementById("devices").textContent = "Error: " + e;
   } finally {
     btn.disabled = false;
+  }
+}
+
+function renderDestinations(destinations) {
+  const el = document.getElementById("destinations");
+  if (!destinations.length) {
+    el.className = "empty";
+    el.textContent = "No destinations configured yet.";
+    return;
+  }
+  el.className = "";
+  const rows = destinations.map(d => `
+    <tr><td>${d.name}</td><td>${d.kind}</td><td>${d.uri}</td></tr>
+  `).join("");
+  el.innerHTML = `<table><thead><tr><th>Name</th><th>Kind</th><th>URI</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function refreshDestinations() {
+  try {
+    knownDestinations = await invoke("list_destinations");
+    renderDestinations(knownDestinations);
+    renderDevices(lastDevices);
+  } catch (e) {
+    document.getElementById("destinations").textContent = "Error: " + e;
+  }
+}
+
+document.getElementById("add-destination-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const name = document.getElementById("dest-name").value.trim();
+  const kind = document.getElementById("dest-kind").value;
+  const uri = document.getElementById("dest-uri").value.trim();
+  const errorBox = document.getElementById("dest-form-error");
+  errorBox.style.display = "none";
+
+  const submitBtn = ev.target.querySelector("button[type=submit]");
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Initializing repository…";
+  try {
+    await invoke("add_destination", { name, kind, uri });
+    document.getElementById("dest-name").value = "";
+    document.getElementById("dest-uri").value = "";
+    await refreshDestinations();
+  } catch (e) {
+    errorBox.style.display = "block";
+    errorBox.textContent = e;
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Add destination";
+  }
+});
+
+function resetArchiveUi(deviceName, destinationName) {
+  document.getElementById("archive-panel").style.display = "block";
+  document.getElementById("archive-device-name").textContent = `${deviceName} → ${destinationName}`;
+  document.getElementById("archive-progress-fill").style.width = "0%";
+  document.getElementById("archive-stat-pct").textContent = "—";
+  document.getElementById("archive-stat-files").textContent = "0";
+  document.getElementById("archive-stat-rate").textContent = "—";
+  document.getElementById("archive-stat-eta").textContent = "—";
+  document.getElementById("archive-status").textContent = "Starting…";
+  document.getElementById("archive-result").innerHTML = "";
+  archiveStart = performance.now();
+}
+
+async function startArchive(device, destinationName) {
+  if (!destinationName) return;
+  resetArchiveUi(device.name ?? device.udid, destinationName);
+  document.getElementById("archive-status").textContent = "Archiving…";
+  try {
+    const summary = await invoke("run_archive", { udid: device.udid, destination: destinationName });
+    document.getElementById("archive-result").innerHTML =
+      `<div class="result ok">Archived: restic snapshot ${summary.snapshot_id} —
+       ${humanBytes(summary.data_added)} new data written
+       (${humanBytes(summary.total_bytes_processed)} processed, ${summary.total_files_processed} files).</div>`;
+    document.getElementById("archive-status").textContent = "Done.";
+  } catch (e) {
+    document.getElementById("archive-result").innerHTML = `<div class="result bad">${e}</div>`;
+    document.getElementById("archive-status").textContent = "Failed.";
   }
 }
 
@@ -342,24 +492,30 @@ async function showHistory(device) {
   }
 }
 
-listen("backup-progress", (event) => {
-  const { files, bytes_done, bytes_total, overall_progress } = event.payload;
+// Shared by both the backup and archive progress panels — same event
+// shape from the same ProgressSink, just a different element-id prefix
+// and start-time reference (see progress.rs's TauriProgress).
+function applyProgress(idPrefix, payload, start) {
+  const { files, bytes_done, bytes_total, overall_progress } = payload;
   const pct = overall_progress >= 0 ? overall_progress
     : (bytes_total > 0 ? (bytes_done / bytes_total) * 100 : null);
 
-  document.getElementById("stat-files").textContent = files;
-  document.getElementById("progress-fill").style.width = (pct ?? 0) + "%";
-  document.getElementById("stat-pct").textContent = pct != null ? pct.toFixed(1) + "%" : "—";
+  document.getElementById(`${idPrefix}stat-files`).textContent = files;
+  document.getElementById(`${idPrefix}progress-fill`).style.width = (pct ?? 0) + "%";
+  document.getElementById(`${idPrefix}stat-pct`).textContent = pct != null ? pct.toFixed(1) + "%" : "—";
 
-  const elapsed = (performance.now() - backupStart) / 1000;
+  const elapsed = (performance.now() - start) / 1000;
   const rate = elapsed > 0 ? bytes_done / elapsed : 0;
-  document.getElementById("stat-rate").textContent = humanBytes(rate) + "/s";
+  document.getElementById(`${idPrefix}stat-rate`).textContent = humanBytes(rate) + "/s";
 
   if (pct != null && pct > 0 && pct < 100) {
     const eta = (elapsed / pct) * (100 - pct);
-    document.getElementById("stat-eta").textContent = humanDuration(eta);
+    document.getElementById(`${idPrefix}stat-eta`).textContent = humanDuration(eta);
   }
-});
+}
+
+listen("backup-progress", (event) => applyProgress("", event.payload, backupStart));
+listen("archive-progress", (event) => applyProgress("archive-", event.payload, archiveStart));
 
 listen("backup-attention", (event) => {
   document.getElementById("attention").classList.toggle("show", event.payload === true);
@@ -377,6 +533,7 @@ listen("backup-retry", (event) => {
 
 document.getElementById("refresh").onclick = refreshDevices;
 refreshDevices();
+refreshDestinations();
 </script>
 </body>
 </html>
