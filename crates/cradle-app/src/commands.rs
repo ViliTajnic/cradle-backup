@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cradle_core::catalog::{ArchiveState, Catalog, DestinationRecord, DeviceRecord, RunKind, RunStatus};
+use cradle_core::power::SleepGuard;
 use cradle_core::{archive, backup, device, keychain, precheck, verify};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -132,6 +133,13 @@ pub struct BackupSummary {
 /// returned here; this only resolves once the whole run is over.
 #[tauri::command]
 pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String>) -> Result<BackupSummary, String> {
+    // Real bug, found via actually running this: a ~75GB backup to an
+    // external drive ran for the better part of an hour and failed near
+    // the end with MBErrorDomain 104 (host-side read/write error),
+    // consistent with the Mac sleeping mid-transfer. Held for the
+    // function's whole duration.
+    let _sleep_guard = SleepGuard::engage();
+
     let working_root = resolve_working_dir(working_dir);
     let catalog = open_catalog()?;
     let provider = device::provider_for(&udid).await.map_err(|e| e.to_string())?;
@@ -400,6 +408,9 @@ pub async fn run_archive(
     destination: String,
     working_dir: Option<String>,
 ) -> Result<ArchiveSummary, String> {
+    // See run_backup's own comment.
+    let _sleep_guard = SleepGuard::engage();
+
     let working_root = resolve_working_dir(working_dir);
     let catalog = open_catalog()?;
 

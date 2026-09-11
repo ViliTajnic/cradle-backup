@@ -16,6 +16,7 @@ use clap_complete::Shell;
 use cradle_core::CradleError;
 use cradle_core::catalog::{ArchiveState, Catalog, DestinationRecord, DeviceRecord, RunKind, RunStatus};
 use cradle_core::crypto::Keybag;
+use cradle_core::power::SleepGuard;
 use cradle_core::{archive, backup, device, keychain, precheck, restore, verify};
 
 use progress::{TerminalProgress, human_bytes};
@@ -369,6 +370,12 @@ async fn run_backup(
     full: bool,
     catalog_path: PathBuf,
 ) -> anyhow::Result<()> {
+    // A real ~75GB backup over USB took the better part of an hour and
+    // failed near the end with MBErrorDomain 104 ("computer-side errors
+    // during backup") — consistent with the Mac going to sleep mid-
+    // transfer during that unattended hour. Held for the whole function.
+    let _sleep_guard = SleepGuard::engage();
+
     let udid = resolve_udid(udid).await?;
     let provider = device::provider_for(&udid).await?;
 
@@ -703,6 +710,11 @@ async fn run_archive_run(
     destination_name: &str,
     working_root: &Path,
 ) -> anyhow::Result<()> {
+    // See run_backup's own comment — archiving to a NAS/cloud destination
+    // is exactly as susceptible to a sleep-induced host I/O failure over a
+    // long, unattended run.
+    let _sleep_guard = SleepGuard::engage();
+
     let destination = resolve_destination(catalog, destination_name)?;
 
     let snapshot = catalog.latest_verified_snapshot(udid)?.ok_or_else(|| {
@@ -816,6 +828,9 @@ async fn run_restore(
     system_files: bool,
     catalog_path: PathBuf,
 ) -> anyhow::Result<()> {
+    // See run_backup's own comment.
+    let _sleep_guard = SleepGuard::engage();
+
     let udid = resolve_udid(udid).await?;
     let source_udid = source_udid.unwrap_or_else(|| udid.clone());
     let provider = device::provider_for(&udid).await?;

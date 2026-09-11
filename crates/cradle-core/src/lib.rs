@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod crypto;
 pub mod device;
 pub mod keychain;
+pub mod power;
 pub mod precheck;
 pub mod restore;
 pub mod verify;
