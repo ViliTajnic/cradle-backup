@@ -24,12 +24,36 @@ use crate::progress::TauriProgress;
 
 /// `~/Cradle/working` — a GUI app has no natural "current directory" the
 /// way a terminal-launched CLI does, so this is a fixed, visible location
-/// rather than the CLI's relative `./working` default.
+/// rather than the CLI's relative `./working` default. Just a fallback:
+/// the frontend lets the user override it (persisted in `localStorage`,
+/// not read back here) and passes that value as `working_dir` to
+/// `run_backup`/`run_archive` — real devices routinely need more room
+/// than a laptop's internal drive has free (see MBErrorDomain 105 in
+/// `backup::device_error_hint`), so a fixed default alone isn't enough.
 fn default_working_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("Cradle")
         .join("working")
+}
+
+fn resolve_working_dir(working_dir: Option<String>) -> PathBuf {
+    match working_dir.map(|d| d.trim().to_string()) {
+        Some(dir) if !dir.is_empty() => expand_tilde(&dir),
+        _ => default_working_dir(),
+    }
+}
+
+/// A GUI text field invites typing `~/...` out of habit — unlike a shell,
+/// nothing expands that for us before it reaches `PathBuf`, so it would
+/// otherwise create a literal directory named `~`.
+fn expand_tilde(path: &str) -> PathBuf {
+    match path.strip_prefix("~/").or_else(|| (path == "~").then_some("")) {
+        Some(rest) => dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        None => PathBuf::from(path),
+    }
 }
 
 fn open_catalog() -> Result<Catalog, String> {
@@ -107,8 +131,8 @@ pub struct BackupSummary {
 /// / [`crate::progress::ATTENTION_EVENT`] events rather than being
 /// returned here; this only resolves once the whole run is over.
 #[tauri::command]
-pub async fn run_backup(app: AppHandle, udid: String) -> Result<BackupSummary, String> {
-    let working_root = default_working_dir();
+pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String>) -> Result<BackupSummary, String> {
+    let working_root = resolve_working_dir(working_dir);
     let catalog = open_catalog()?;
     let provider = device::provider_for(&udid).await.map_err(|e| e.to_string())?;
 
@@ -370,8 +394,13 @@ pub struct ArchiveSummary {
 /// [`crate::progress::ARCHIVE_PROGRESS_EVENT`] events, same pattern as
 /// [`run_backup`].
 #[tauri::command]
-pub async fn run_archive(app: AppHandle, udid: String, destination: String) -> Result<ArchiveSummary, String> {
-    let working_root = default_working_dir();
+pub async fn run_archive(
+    app: AppHandle,
+    udid: String,
+    destination: String,
+    working_dir: Option<String>,
+) -> Result<ArchiveSummary, String> {
+    let working_root = resolve_working_dir(working_dir);
     let catalog = open_catalog()?;
 
     let destination_record = catalog

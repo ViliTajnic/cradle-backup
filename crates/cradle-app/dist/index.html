@@ -163,6 +163,19 @@
   </header>
   <main>
     <section class="panel">
+      <h2>Working Directory</h2>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <input id="working-dir" style="flex:1; font:inherit; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--text);" />
+        <button id="working-dir-save">Save</button>
+      </div>
+      <div class="status-line">
+        Where backups are written — <code>&lt;this&gt;/&lt;UDID&gt;/</code>. Never a network
+        mount while a device is actively backing up. Change this to an external drive if your
+        internal disk doesn't have enough free space for the device's backup.
+      </div>
+    </section>
+
+    <section class="panel">
       <h2>Devices</h2>
       <div id="devices" class="empty">Looking for devices…</div>
     </section>
@@ -236,6 +249,23 @@ let backupStart = null;
 let archiveStart = null;
 let knownDestinations = [];
 let lastDevices = [];
+
+const WORKING_DIR_KEY = "cradle.workingDir";
+
+function getWorkingDir() {
+  // Empty string means "let the Rust side use its own default"
+  // (~/Cradle/working) — see commands.rs's resolve_working_dir.
+  return localStorage.getItem(WORKING_DIR_KEY) || "";
+}
+
+function initWorkingDirField() {
+  const input = document.getElementById("working-dir");
+  input.value = getWorkingDir();
+  input.placeholder = "~/Cradle/working (default)";
+  document.getElementById("working-dir-save").onclick = () => {
+    localStorage.setItem(WORKING_DIR_KEY, input.value.trim());
+  };
+}
 
 function humanBytes(bytes) {
   if (bytes == null) return "—";
@@ -416,7 +446,11 @@ async function startArchive(device, destinationName) {
   resetArchiveUi(device.name ?? device.udid, destinationName);
   document.getElementById("archive-status").textContent = "Archiving…";
   try {
-    const summary = await invoke("run_archive", { udid: device.udid, destination: destinationName });
+    const summary = await invoke("run_archive", {
+      udid: device.udid,
+      destination: destinationName,
+      workingDir: getWorkingDir() || null,
+    });
     document.getElementById("archive-result").innerHTML =
       `<div class="result ok">Archived: restic snapshot ${summary.snapshot_id} —
        ${humanBytes(summary.data_added)} new data written
@@ -445,7 +479,7 @@ function resetBackupUi(name) {
 async function startBackup(device) {
   resetBackupUi(device.name ?? device.udid);
   try {
-    const summary = await invoke("run_backup", { udid: device.udid });
+    const summary = await invoke("run_backup", { udid: device.udid, workingDir: getWorkingDir() || null });
     const result = document.getElementById("backup-result");
     if (summary.verified) {
       result.innerHTML = `<div class="result ok">Verified: ${summary.files} files, ${humanBytes(summary.bytes)}.
@@ -532,6 +566,7 @@ listen("backup-retry", (event) => {
 });
 
 document.getElementById("refresh").onclick = refreshDevices;
+initWorkingDirField();
 refreshDevices();
 refreshDestinations();
 </script>

@@ -9,8 +9,20 @@ mod progress;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // idevice logs through `tracing`, not the `log` facade
+    // tauri-plugin-log builds on — the two can't coexist (both try to
+    // install themselves as the global `log` logger; tracing-subscriber's
+    // log-capture bridge panics on the second attempt at startup), and
+    // this is what actually surfaces idevice's internal debug/warn output
+    // for diagnosing a device protocol failure. Same setup as cradle-cli's
+    // own main() — dropped tauri-plugin-log rather than try to reconcile
+    // the two loggers, since nothing here needed its in-webview console
+    // bridging.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             commands::list_devices,
             commands::run_backup,
