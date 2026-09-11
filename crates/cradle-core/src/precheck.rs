@@ -25,6 +25,14 @@ use crate::device::{self, DeviceInfo};
 /// once the catalog exists (M2/M3).
 pub const MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Conservative floor for "enough free memory to survive a multi-hour
+/// backup without a host-side I/O error" (MBErrorDomain 104). Confirmed
+/// against a real device — see [`crate::memory`]'s module doc — that this
+/// error hit repeatedly, every time free memory was under ~150MB. 1 GiB
+/// gives real headroom above that observed failure point without being an
+/// unreasonable bar on a modern Mac.
+pub const MIN_FREE_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Result of running all M0 prechecks against one device.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -33,21 +41,30 @@ pub struct Report {
     pub encryption_enabled: bool,
     pub free_space_bytes: u64,
     pub free_space_ok: bool,
+    /// `None` when free memory couldn't be measured (non-macOS, or
+    /// `vm_stat` unavailable) — [`Self::free_memory_ok`] treats that as
+    /// passing rather than blocking on an unmeasurable condition.
+    pub free_memory_bytes: Option<u64>,
+    pub free_memory_ok: bool,
     pub device: Option<DeviceInfo>,
 }
 
 impl Report {
     /// `true` only if every check passed. A backup must not start otherwise.
     pub fn passed(&self) -> bool {
-        self.pairing_valid && self.encryption_enabled && self.free_space_ok
+        self.pairing_valid && self.encryption_enabled && self.free_space_ok && self.free_memory_ok
     }
 }
 
 /// Runs every M0 precheck against `provider`, evaluating free space on the
-/// volume backing `working_dir`.
+/// volume backing `working_dir` and free memory on this Mac.
 pub async fn run(provider: &dyn IdeviceProvider, working_dir: &Path) -> Result<Report, CradleError> {
     let free_space_bytes = FsBackupDelegate.get_free_disk_space(working_dir);
     let free_space_ok = free_space_bytes >= MIN_FREE_BYTES;
+    let free_memory_bytes = crate::memory::free_bytes();
+    let free_memory_ok = free_memory_bytes
+        .map(|bytes| bytes >= MIN_FREE_MEMORY_BYTES)
+        .unwrap_or(true);
 
     match device::lockdown_session(provider).await {
         Ok(mut lockdown) => {
@@ -65,6 +82,8 @@ pub async fn run(provider: &dyn IdeviceProvider, working_dir: &Path) -> Result<R
                 encryption_enabled,
                 free_space_bytes,
                 free_space_ok,
+                free_memory_bytes,
+                free_memory_ok,
                 device,
             })
         }
@@ -74,6 +93,8 @@ pub async fn run(provider: &dyn IdeviceProvider, working_dir: &Path) -> Result<R
             encryption_enabled: false,
             free_space_bytes,
             free_space_ok,
+            free_memory_bytes,
+            free_memory_ok,
             device: None,
         }),
     }

@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod crypto;
 pub mod device;
 pub mod keychain;
+pub mod memory;
 pub mod notify;
 pub mod power;
 pub mod precheck;

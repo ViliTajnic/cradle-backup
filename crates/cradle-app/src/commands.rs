@@ -190,6 +190,16 @@ pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String
             precheck::MIN_FREE_BYTES,
         ));
     }
+    if !precheck_report.free_memory_ok {
+        return Err(format!(
+            "Only {} bytes of free memory on this Mac; want at least {} bytes before starting a \
+             backup — a multi-hour transfer with this little headroom risks a real host-side \
+             I/O error partway through (device error 104), not just a slow one. Close some apps \
+             or browser tabs and try again.",
+            precheck_report.free_memory_bytes.unwrap_or(0),
+            precheck::MIN_FREE_MEMORY_BYTES,
+        ));
+    }
 
     let device_info = precheck_report
         .device

@@ -421,6 +421,16 @@ async fn run_backup(
             human_bytes(precheck::MIN_FREE_BYTES),
         );
     }
+    if !precheck_report.free_memory_ok {
+        anyhow::bail!(
+            "Only {} of free memory on this Mac; want at least {} before starting a backup — a \
+             multi-hour transfer with this little headroom risks a real host-side I/O error \
+             partway through (device error 104), not just a slow one. Close some apps or \
+             browser tabs and try again.",
+            human_bytes(precheck_report.free_memory_bytes.unwrap_or(0)),
+            human_bytes(precheck::MIN_FREE_MEMORY_BYTES),
+        );
+    }
 
     let device_info = precheck_report.device.clone().ok_or_else(|| {
         anyhow::anyhow!("prechecks passed but returned no device info — this is a bug")
