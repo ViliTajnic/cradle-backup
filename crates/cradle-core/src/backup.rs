@@ -24,6 +24,21 @@ use idevice::{
 
 use crate::CradleError;
 
+/// Size of the buffer wrapped around every file handle
+/// [`CradleDelegate`]/[`FsProgressDelegate`] hand back from
+/// `open_file_read`. Read-only: `create_file_write`'s handle is
+/// deliberately left unbuffered — see that method's own doc comment for
+/// why buffering the write side is unsafe here specifically. 256 KiB is
+/// negligible memory (the protocol only ever has one or two files open at
+/// a time; this is not a source of the memory pressure that caused the
+/// 104 errors) for a real cut in read syscalls on larger files sent during
+/// restore.
+const IO_BUFFER_CAPACITY: usize = 256 * 1024;
+
+fn buffered_read(inner: Box<dyn Read + Send>) -> Box<dyn Read + Send> {
+    Box::new(std::io::BufReader::with_capacity(IO_BUFFER_CAPACITY, inner))
+}
+
 /// Fired by iOS when it needs the user to authenticate (passcode/Face ID)
 /// before granting a connected accessory access to protected data.
 const AUTH_PRESENTED: &str = "com.apple.LocalAuthentication.ui.presented";
@@ -134,6 +149,17 @@ impl From<CradleError> for BackupError {
 /// alternate `BackupDelegate` implementations, not a copy step bolted on
 /// afterwards. A future destination-aware delegate replaces `fs` here
 /// without touching anything in this file.
+///
+/// `open_file_read` wraps `FsBackupDelegate`'s handle in a buffer rather
+/// than forwarding it raw — see [`IO_BUFFER_CAPACITY`].
+/// `create_file_write` deliberately does not: the `idevice` protocol loop
+/// never calls `.flush()`, only lets the handle drop once a file's data
+/// blocks are done, and `BufWriter`'s drop-time flush silently discards
+/// any I/O error — a disk hiccup on the last partial buffer would produce
+/// a truncated file with nothing to catch it (the verification gate checks
+/// file *count*, not per-file content). Not worth that risk for what's a
+/// modest win anyway, since the protocol already writes in
+/// device-message-sized blocks, not byte-by-byte.
 struct CradleDelegate {
     fs: FsBackupDelegate,
     progress: Arc<dyn ProgressSink>,
@@ -154,7 +180,7 @@ impl BackupDelegate for CradleDelegate {
         &'a self,
         path: &'a Path,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Read + Send>, IdeviceError>> + Send + 'a>> {
-        self.fs.open_file_read(path)
+        Box::pin(async move { self.fs.open_file_read(path).await.map(buffered_read) })
     }
 
     fn create_file_write<'a>(
@@ -267,7 +293,7 @@ impl BackupDelegate for FsProgressDelegate {
         &'a self,
         path: &'a Path,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Read + Send>, IdeviceError>> + Send + 'a>> {
-        self.fs.open_file_read(path)
+        Box::pin(async move { self.fs.open_file_read(path).await.map(buffered_read) })
     }
 
     fn create_file_write<'a>(
