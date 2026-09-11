@@ -13,14 +13,22 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use idevice::{
     IdeviceError, IdeviceService,
     mobilebackup2::{BackupDelegate, DirEntryInfo, FsBackupDelegate, MobileBackup2Client},
+    notification_proxy::NotificationProxyClient,
     provider::IdeviceProvider,
 };
 
 use crate::CradleError;
+
+/// Fired by iOS when it needs the user to authenticate (passcode/Face ID)
+/// before granting a connected accessory access to protected data.
+const AUTH_PRESENTED: &str = "com.apple.LocalAuthentication.ui.presented";
+/// Fired when that prompt is resolved, one way or another.
+const AUTH_DISMISSED: &str = "com.apple.LocalAuthentication.ui.dismissed";
 
 /// Receives honest, measurable progress during a backup.
 ///
@@ -34,6 +42,19 @@ pub trait ProgressSink: Send + Sync {
     /// negative when it hasn't reported one.
     fn on_progress(&self, bytes_done: u64, bytes_total: u64, overall_progress: f64);
     fn on_file(&self, path: &str, file_count: u32);
+
+    /// Fires when the device needs the user to physically look at it —
+    /// concretely, when iOS shows an on-device passcode/Face ID prompt to
+    /// authorize access to protected data (`true`), and again once that
+    /// prompt is resolved (`false`).
+    ///
+    /// This is not a hypothetical: if nobody dismisses that prompt, the
+    /// backup fails with MBErrorDomain 208 ("device locked when iOS needed
+    /// to access protected data") — a real failure mode hit on the very
+    /// first real-device run of this code. Default no-op so existing sinks
+    /// don't have to know about it, but a UI that ignores this will
+    /// silently stall until the user happens to glance at their phone.
+    fn on_attention_needed(&self, _needed: bool) {}
 }
 
 /// A [`ProgressSink`] that discards everything. Useful for callers (tests,
@@ -154,6 +175,10 @@ impl BackupDelegate for CradleDelegate {
 /// reports in a `DLMessageProcessMessage` final response, per CLAUDE.md's
 /// "error messages name the fix, not the symptom" rule. `None` for anything
 /// not worth a specific hint yet — the raw code is still shown to the user.
+///
+/// 208 (device locked) is deliberately not here — it gets its own
+/// [`CradleError::DeviceLocked`] variant in [`run`] instead of a string,
+/// since [`run_resilient`] retries on it specifically.
 fn device_error_hint(code: i64) -> Option<&'static str> {
     match code {
         100 => Some(
@@ -174,10 +199,6 @@ fn device_error_hint(code: i64) -> Option<&'static str> {
             "invalid or missing backup password — set/confirm the encrypted backup password \
              in Finder (General > Transfer or Reset > Change Password), then retry",
         ),
-        208 => Some(
-            "the device was locked when iOS needed to access protected data — unlock it with \
-             its passcode and keep it unlocked and awake for the whole backup, then retry",
-        ),
         209 => Some(
             "the device couldn't find the encryption key for one of its files — retry with \
              --full to force a fresh backup",
@@ -187,6 +208,31 @@ fn device_error_hint(code: i64) -> Option<&'static str> {
     }
 }
 
+/// Watches for the on-device passcode/Face ID prompt for as long as the
+/// caller keeps polling this future, forwarding presented/dismissed
+/// transitions to `progress`.
+///
+/// Never resolves under normal operation — including when the notification
+/// proxy connection dies or `observe_notifications` fails, since a device
+/// that can't be watched shouldn't take down the backup racing against it
+/// in [`run`]'s `tokio::select!`. It's meant to be raced, not awaited alone.
+async fn watch_auth_prompts(mut client: NotificationProxyClient, progress: Arc<dyn ProgressSink>) {
+    if client
+        .observe_notifications(&[AUTH_PRESENTED, AUTH_DISMISSED])
+        .await
+        .is_ok()
+    {
+        while let Ok(name) = client.receive_notification().await {
+            match name.as_str() {
+                AUTH_PRESENTED => progress.on_attention_needed(true),
+                AUTH_DISMISSED => progress.on_attention_needed(false),
+                _ => {}
+            }
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
 /// Backs up the device behind `provider` into `working_root/<UDID>/`.
 ///
 /// `working_root` must be the canonical working directory — never a network
@@ -194,6 +240,13 @@ fn device_error_hint(code: i64) -> Option<&'static str> {
 /// prior `Status.plist` / `Manifest.plist` / `Manifest.db` here on the next
 /// run to compute an incremental; deleting or relocating this directory
 /// between runs forces a full transfer.
+///
+/// Watches for the device's own on-screen passcode/Face ID prompt for the
+/// duration of the transfer and reports it via
+/// [`ProgressSink::on_attention_needed`] — see that method's docs for why:
+/// without this, a backup that needs protected data access can stall or
+/// fail (MBErrorDomain 208) with no visible cause, because the thing that
+/// needs the user's attention is on the *phone's* screen, not the host's.
 pub async fn run(
     provider: &dyn IdeviceProvider,
     working_root: &Path,
@@ -217,17 +270,33 @@ pub async fn run(
 
     let delegate = CradleDelegate {
         fs: FsBackupDelegate,
-        progress,
+        progress: progress.clone(),
         files_received: AtomicU64::new(0),
     };
 
-    let response = client
-        .backup_from_path(working_root, None, options, &delegate)
-        .await?;
+    // Best-effort: a device that refuses this second connection still gets
+    // backed up, just without the live "look at your phone" signal.
+    let notification_proxy = NotificationProxyClient::connect(provider).await.ok();
+
+    let backup = client.backup_from_path(working_root, None, options, &delegate);
+    let response = match notification_proxy {
+        Some(np_client) => {
+            tokio::select! {
+                result = backup => result,
+                _ = watch_auth_prompts(np_client, progress) => {
+                    unreachable!("watch_auth_prompts never resolves")
+                }
+            }
+        }
+        None => backup.await,
+    }?;
 
     if let Some(dict) = &response {
         if let Some(code) = dict.get("ErrorCode") {
             let number = code.as_signed_integer();
+            if number == Some(208) {
+                return Err(CradleError::DeviceLocked);
+            }
             let hint = number.and_then(device_error_hint);
             let message = match (number, hint) {
                 (Some(n), Some(hint)) => format!("device backup error {n}: {hint}"),
@@ -243,4 +312,42 @@ pub async fn run(
         udid,
         files_received: delegate.files_received.load(Ordering::Relaxed),
     })
+}
+
+/// How many times [`run_resilient`] retries a backup that failed because
+/// the device locked mid-transfer, and how long it waits between tries.
+///
+/// This is a safety net behind [`ProgressSink::on_attention_needed`], not a
+/// substitute for it: the live prompt should catch this before it happens.
+/// It exists because libimobiledevice's own issue tracker has cases of this
+/// surfacing with no clear trigger the host side can see coming, and
+/// because retrying costs little — the working directory's partial state
+/// lets the device compute an incremental rather than starting over.
+pub const LOCK_RETRY_ATTEMPTS: u32 = 5;
+pub const LOCK_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// Runs [`run`], automatically retrying up to [`LOCK_RETRY_ATTEMPTS`] times
+/// if the device reports [`CradleError::DeviceLocked`]. `on_retry(attempt,
+/// max_attempts)` fires before each wait so a caller can tell the user to
+/// unlock the device — it's already too late for `on_attention_needed` to
+/// have caught this one.
+pub async fn run_resilient(
+    provider: &dyn IdeviceProvider,
+    working_root: &Path,
+    force_full: bool,
+    progress: Arc<dyn ProgressSink>,
+    on_retry: impl Fn(u32, u32),
+) -> Result<Outcome, CradleError> {
+    let mut attempt = 1;
+    loop {
+        match run(provider, working_root, force_full, progress.clone()).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(CradleError::DeviceLocked) if attempt < LOCK_RETRY_ATTEMPTS => {
+                on_retry(attempt, LOCK_RETRY_ATTEMPTS);
+                tokio::time::sleep(LOCK_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }

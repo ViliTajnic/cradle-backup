@@ -13,7 +13,8 @@ description = "Device protocol, prechecks and backup orchestration for Cradle."
 idevice = { version = "=0.1.65", default-features = true, features = [
     "usbmuxd",
     "mobilebackup2",
+    "notification_proxy",
 ] }
 plist = "1.8"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "rt"] }
+tokio = { version = "1", features = ["fs", "rt", "time"] }

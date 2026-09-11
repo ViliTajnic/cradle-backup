@@ -135,7 +135,21 @@ async fn run_backup(udid: Option<String>, working_root: PathBuf, full: bool) -> 
     println!("Prechecks passed. Backing up into {}...", working_root.display());
 
     let progress = Arc::new(TerminalProgress::new());
-    let outcome = backup::run(&*provider, &working_root, full, progress.clone()).await?;
+    let outcome = backup::run_resilient(
+        &*provider,
+        &working_root,
+        full,
+        progress.clone(),
+        |attempt, max_attempts| {
+            eprintln!(
+                "\nDevice locked mid-backup — unlock it now. Retrying in {}s (attempt {}/{})...",
+                backup::LOCK_RETRY_DELAY.as_secs(),
+                attempt,
+                max_attempts
+            );
+        },
+    )
+    .await?;
     progress.finish();
 
     println!("Verifying backup...");

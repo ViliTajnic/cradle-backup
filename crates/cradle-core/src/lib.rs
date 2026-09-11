@@ -24,6 +24,15 @@ pub enum CradleError {
     #[error("device did not report a UDID")]
     MissingUdid,
 
+    /// MBErrorDomain 208. Split out from [`Self::Other`] because it's
+    /// recoverable: see [`backup::run_resilient`], which retries on exactly
+    /// this variant.
+    #[error(
+        "the device was locked when iOS needed to access protected data — unlock it and keep \
+         it unlocked and awake for the whole backup"
+    )]
+    DeviceLocked,
+
     #[error("{0}")]
     Other(String),
 }

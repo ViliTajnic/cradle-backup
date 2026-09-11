@@ -77,6 +77,17 @@ impl ProgressSink for TerminalProgress {
         );
         let _ = std::io::stderr().flush();
     }
+
+    fn on_attention_needed(&self, needed: bool) {
+        if needed {
+            eprintln!(
+                "\n>>> Look at your device now — enter your passcode (or use Face ID/Touch ID) \
+                 to let the backup continue. <<<"
+            );
+        } else {
+            eprintln!("Thanks — continuing.");
+        }
+    }
 }
 
 pub fn human_bytes(bytes: u64) -> String {
