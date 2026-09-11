@@ -132,13 +132,50 @@ they need `restic` on PATH; run with `cargo test -- --ignored`), plus a
 full manual CLI smoke test (`destination add` → `archive run` → `list` →
 `check` → `prune`, catalog rows confirmed via `sqlite3`).
 
-## M4 — Restore
+## M4 — Restore 🟡 built, unverified against a real target device
 
 `restic restore` into scratch, then restore protocol from there.
 Full prechecks: Find My off, target iOS >= backup iOS, pairing valid.
 Cross-device migration via `source_identifier`.
 
 Free forever, no license check on this path.
+
+`restore.rs` supports two sources, both landing in a scratch directory
+before the device ever sees them (CLAUDE.md: restore "does not touch the
+working set"): `stage_from_working` copies `working/<UDID>/` as-is (the
+common case — you just backed up, now you're testing restore), or
+`archive::restore` pulls a specific restic snapshot. The latter needed one
+real-world correction: restic mirrors a snapshot's *original absolute
+path* under `--target` rather than flattening it (confirmed with a real
+restore — backing up `/tmp/rrt/source/UDID` and restoring into
+`/tmp/rrt/scratch` produced `/tmp/rrt/scratch/tmp/rrt/source/UDID`), so
+the resolved path is computed from the snapshot's own recorded `paths[0]`
+rather than assumed.
+
+`RestoreOptions.reboot`/`.system_files` are exposed; nothing else — per
+CLAUDE.md, selective restore isn't happening, and the remaining flags on
+`idevice`'s `RestoreOptions` don't have an obvious default worth exposing
+yet.
+
+The two restore-only prechecks: Find My via lockdown's `com.apple.fmip`
+domain, key `IsAssociated` (undocumented by Apple, but well attested by
+years of libimobiledevice community usage — defaults to the *stricter*
+assumption if the query fails, since a false "off" here risks a
+Find-My-locked restore attempt) and target iOS >= backup iOS, comparing
+dotted-version components numerically rather than as strings (`"10.0" >
+"9.0"`, not the lexical `"9.0" > "10.0"`) — the backup's own version comes
+from its `Info.plist`'s `"Product Version"` key, exactly as CLAUDE.md
+specifies, not from whatever the original source device happens to be
+running now.
+
+The device-protocol call itself (`MobileBackup2Client::restore_from_path`)
+is unverified against a real target device — everything short of that
+(staging from both sources, `Info.plist` version reading, the fmip
+precheck logic, CLI argument wiring) has been exercised for real. Per
+`ROADMAP.md`'s own sequencing rule this would normally block M5, but
+building has continued through M7 with real backup-and-restore-to-another-
+device testing deferred to once the whole stack exists — see the top of
+this file for the same deferral on M0.
 
 ## M5 — Crypto layer
 

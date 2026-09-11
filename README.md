@@ -6,8 +6,12 @@ real progress instead of an indeterminate spinner.
 
 See [`CLAUDE.md`](./CLAUDE.md) for the project's non-negotiables and
 architecture, and [`ROADMAP.md`](./ROADMAP.md) for the milestone plan. This
-repo is at **M3** — protocol spike + verification gate + catalog + archive
-layer, partially verified against real hardware and real infrastructure.
+repo is at **M4** — protocol spike + verification gate + catalog + archive
+layer + restore, partially verified against real hardware and real
+infrastructure. Building has continued through M7 with a real
+backup-and-restore-to-another-device test deliberately deferred until the
+whole stack exists — see `ROADMAP.md` for exactly what has and hasn't been
+exercised at each milestone.
 
 ## Status
 
@@ -32,16 +36,20 @@ the real macOS Keychain (not just unit tests) — see `ROADMAP.md`'s M3
 section for two real bugs that testing caught, including one that would
 have hung real users' terminals indefinitely on a macOS Keychain dialog.
 
+M4's restore path is built and its staging/precheck logic exercised for
+real, but the actual on-device restore protocol call has not yet run
+against a real target device — see `ROADMAP.md`'s M4 section.
+
 ## Layout
 
 - `crates/cradle-core` — device discovery, prechecks, the `mobilebackup2`
   backup path, the post-backup verification gate, the catalog
   (`devices`/`runs`/`snapshots`/`destinations`/`archives` in SQLite), the
-  restic-backed archive layer, and Keychain access for repository
-  passwords. No UI, no restore yet (later milestones).
+  restic-backed archive layer, Keychain access for repository passwords,
+  and restore (including cross-device migration). No UI yet (M7).
 - `crates/cradle-cli` — the `cradle` binary: `cradle devices`,
   `cradle backup`, `cradle history`, `cradle destination add/list`,
-  `cradle archive run/list/prune/check`.
+  `cradle archive run/list/prune/check`, `cradle restore`.
 
 ## Building
 
@@ -68,6 +76,10 @@ cradle archive run --udid <UDID> --destination nas
 cradle archive list --destination nas       # snapshots actually in the repo
 cradle archive prune --destination nas --keep-last 10
 cradle archive check --destination nas      # full repo integrity check
+
+cradle restore --udid <UDID>                              # restore a device's own backup onto itself
+cradle restore --udid <NEW_UDID> --source-udid <OLD_UDID> # cross-device migration
+cradle restore --udid <UDID> --from-archive nas --restic-snapshot <id>
 ```
 
 `working/` is the canonical working directory (see `CLAUDE.md`): it is

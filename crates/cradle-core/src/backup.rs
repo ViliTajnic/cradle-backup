@@ -193,6 +193,104 @@ impl BackupDelegate for CradleDelegate {
     }
 }
 
+/// [`BackupDelegate`] that stores to the local filesystem while forwarding
+/// progress to a [`ProgressSink`] — everything [`CradleDelegate`] does,
+/// minus the file/byte counters that only the M1 verification gate needs.
+///
+/// `restore.rs` uses this: `FsBackupDelegate` alone is a silent no-op for
+/// `on_progress`/`on_file_received` (its own impl doesn't override the
+/// trait's empty defaults), and restore has no gate to feed counters into
+/// — it either succeeds or fails per the device's own response. Shared
+/// here rather than duplicated in `restore.rs` because the eight
+/// filesystem methods below are pure forwarding boilerplate either way.
+pub(crate) struct FsProgressDelegate {
+    fs: FsBackupDelegate,
+    progress: Arc<dyn ProgressSink>,
+}
+
+impl FsProgressDelegate {
+    pub(crate) fn new(progress: Arc<dyn ProgressSink>) -> Self {
+        Self {
+            fs: FsBackupDelegate,
+            progress,
+        }
+    }
+}
+
+impl BackupDelegate for FsProgressDelegate {
+    fn get_free_disk_space(&self, path: &Path) -> u64 {
+        self.fs.get_free_disk_space(path)
+    }
+
+    fn open_file_read<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Read + Send>, IdeviceError>> + Send + 'a>> {
+        self.fs.open_file_read(path)
+    }
+
+    fn create_file_write<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Write + Send>, IdeviceError>> + Send + 'a>> {
+        self.fs.create_file_write(path)
+    }
+
+    fn create_dir_all<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + 'a>> {
+        self.fs.create_dir_all(path)
+    }
+
+    fn remove<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + 'a>> {
+        self.fs.remove(path)
+    }
+
+    fn rename<'a>(
+        &'a self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + 'a>> {
+        self.fs.rename(from, to)
+    }
+
+    fn copy<'a>(
+        &'a self,
+        src: &'a Path,
+        dst: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + 'a>> {
+        self.fs.copy(src, dst)
+    }
+
+    fn exists<'a>(&'a self, path: &'a Path) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        self.fs.exists(path)
+    }
+
+    fn is_dir<'a>(&'a self, path: &'a Path) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        self.fs.is_dir(path)
+    }
+
+    fn list_dir<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DirEntryInfo>, IdeviceError>> + Send + 'a>> {
+        self.fs.list_dir(path)
+    }
+
+    fn on_file_received(&self, path: &str, file_count: u32) {
+        self.progress.on_file(path, file_count);
+    }
+
+    fn on_progress(&self, bytes_done: u64, bytes_total: u64, overall_progress: f64) {
+        self.progress
+            .on_progress(bytes_done, bytes_total, overall_progress);
+    }
+}
+
 /// Names the fix for the `MBErrorDomain` codes the device most commonly
 /// reports in a `DLMessageProcessMessage` final response, per CLAUDE.md's
 /// "error messages name the fix, not the symptom" rule. `None` for anything

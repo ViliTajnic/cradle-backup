@@ -1,8 +1,10 @@
 //! Cradle CLI — M0 connect/precheck/backup, M1 verification gate, M2
-//! catalog, M3 archive layer.
+//! catalog, M3 archive layer, M4 restore.
 //!
 //! Per CLAUDE.md, the CLI is not a debug tool: it ships, it is supported,
-//! and it is the free tier's complete interface.
+//! and it is the free tier's complete interface. Restore in particular is
+//! free, unconditional, forever (non-negotiable #1) — nothing on the
+//! `run_restore` path below checks a license or calls out to a server.
 
 mod progress;
 
@@ -12,7 +14,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use cradle_core::CradleError;
 use cradle_core::catalog::{ArchiveState, Catalog, DestinationRecord, DeviceRecord, RunKind, RunStatus};
-use cradle_core::{archive, backup, device, keychain, precheck, verify};
+use cradle_core::{archive, backup, device, keychain, precheck, restore, verify};
 
 use progress::{TerminalProgress, human_bytes};
 
@@ -52,6 +54,41 @@ enum Command {
     History {
         #[arg(long)]
         udid: String,
+    },
+    /// Restores a backup onto a device. Free, unconditional, forever — no
+    /// license check, no network call (CLAUDE.md non-negotiable #1).
+    Restore {
+        /// Target device UDID — the device being restored *onto*.
+        #[arg(long)]
+        udid: Option<String>,
+        /// UDID the backup was originally taken from, if different from
+        /// `--udid`. Omit to restore a device's own backup onto itself;
+        /// set this for cross-device migration.
+        #[arg(long)]
+        source_udid: Option<String>,
+        /// Pull from this archive destination instead of the local
+        /// working directory. Requires `--restic-snapshot`.
+        #[arg(long, requires = "restic_snapshot")]
+        from_archive: Option<String>,
+        /// Which restic snapshot to restore, when `--from-archive` is
+        /// given (see `cradle archive list`).
+        #[arg(long, requires = "from_archive")]
+        restic_snapshot: Option<String>,
+        /// Where the local backup lives, when not restoring from an
+        /// archive. Must match what `cradle backup` used.
+        #[arg(long, default_value = "working")]
+        working_dir: PathBuf,
+        /// Staging area the restore is run from — never the working
+        /// directory itself (see CLAUDE.md's architecture rule).
+        #[arg(long, default_value = "scratch")]
+        scratch_dir: PathBuf,
+        /// Don't reboot the target device once the restore finishes.
+        #[arg(long)]
+        no_reboot: bool,
+        /// Also restore system files (off by default, matching
+        /// `idevice`'s own `RestoreOptions` default).
+        #[arg(long)]
+        system_files: bool,
     },
     /// Manage archive destinations (restic repositories).
     Destination {
@@ -156,6 +193,29 @@ async fn main() -> anyhow::Result<()> {
         Command::History { udid } => run_history(udid, catalog_path),
         Command::Destination { command } => run_destination(command, catalog_path).await,
         Command::Archive { command } => run_archive(command, catalog_path).await,
+        Command::Restore {
+            udid,
+            source_udid,
+            from_archive,
+            restic_snapshot,
+            working_dir,
+            scratch_dir,
+            no_reboot,
+            system_files,
+        } => {
+            run_restore(
+                udid,
+                source_udid,
+                from_archive,
+                restic_snapshot,
+                working_dir,
+                scratch_dir,
+                no_reboot,
+                system_files,
+                catalog_path,
+            )
+            .await
+        }
     }
 }
 
@@ -619,5 +679,106 @@ async fn run_archive_check(catalog: &Catalog, destination_name: &str) -> anyhow:
             "restic check found {} error(s) in '{destination_name}'.",
             summary.num_errors
         );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_restore(
+    udid: Option<String>,
+    source_udid: Option<String>,
+    from_archive: Option<String>,
+    restic_snapshot: Option<String>,
+    working_root: PathBuf,
+    scratch_root: PathBuf,
+    no_reboot: bool,
+    system_files: bool,
+    catalog_path: PathBuf,
+) -> anyhow::Result<()> {
+    let udid = resolve_udid(udid).await?;
+    let source_udid = source_udid.unwrap_or_else(|| udid.clone());
+    let provider = device::provider_for(&udid).await?;
+    let catalog = Catalog::open(&catalog_path)?;
+
+    println!("Staging backup for restore...");
+    let staged_dir = match (from_archive, restic_snapshot) {
+        (Some(destination_name), Some(snapshot_id)) => {
+            let destination = resolve_destination(&catalog, &destination_name)?;
+            let progress = Arc::new(TerminalProgress::new());
+            let summary = archive::restore(&destination, &snapshot_id, &scratch_root, progress.clone()).await?;
+            progress.finish();
+            println!(
+                "Restored {} file(s) ({}) from '{destination_name}' into scratch.",
+                summary.files_restored,
+                human_bytes(summary.total_bytes)
+            );
+            summary.path
+        }
+        _ => restore::stage_from_working(&working_root, &source_udid, &scratch_root).await?,
+    };
+
+    let backup_ios = restore::backup_ios_version(&staged_dir)?;
+
+    println!("Running restore prechecks...");
+    let report = precheck::run_restore(&*provider, &backup_ios).await?;
+
+    if let Some(info) = &report.device {
+        println!(
+            "Target device: {} ({}, iOS {})",
+            info.name, info.product_type, info.ios_version
+        );
+    }
+    if !report.pairing_valid {
+        anyhow::bail!(report
+            .pairing_message
+            .unwrap_or_else(|| "Pairing check failed.".to_string()));
+    }
+    if !report.find_my_disabled {
+        anyhow::bail!(
+            "Find My is enabled on the target device. Disable it under Settings > [name] > \
+             Find My > Find My iPhone before restoring."
+        );
+    }
+    if !report.target_ios_ok {
+        anyhow::bail!(
+            "Target device is on iOS {}, but this backup is from iOS {} — restoring backward \
+             isn't supported. Update the target device first.",
+            report.target_ios_version.as_deref().unwrap_or("unknown"),
+            report.backup_ios_version,
+        );
+    }
+
+    let run_id = catalog.start_run(&udid, RunKind::Restore)?;
+
+    let config = restore::RestoreConfig {
+        reboot: !no_reboot,
+        system_files,
+    };
+
+    println!(
+        "Restoring {} (source {source_udid}) onto target {udid}...",
+        staged_dir.display()
+    );
+    let progress = Arc::new(TerminalProgress::new());
+    let result = restore::run(&*provider, &staged_dir, &source_udid, &config, progress.clone()).await;
+    progress.finish();
+
+    match result {
+        Ok(outcome) => {
+            catalog.finish_run(run_id, RunStatus::Succeeded, 0, 0, None)?;
+            println!(
+                "Restore complete on {}.{}",
+                outcome.target_udid,
+                if config.reboot {
+                    " Device will reboot."
+                } else {
+                    ""
+                }
+            );
+            Ok(())
+        }
+        Err(e) => {
+            catalog.finish_run(run_id, RunStatus::Failed, 0, 0, Some(&e.to_string()))?;
+            Err(e.into())
+        }
     }
 }

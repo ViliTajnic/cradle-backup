@@ -293,6 +293,119 @@ pub async fn list_snapshots(destination: &DestinationRecord) -> Result<Vec<Resti
         .map_err(|e| CradleError::Other(format!("could not parse restic snapshots output: {e}")))
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "message_type", rename_all = "snake_case")]
+enum ResticRestoreMessage {
+    // Field names and `omitempty` semantics taken straight from restic's
+    // own internal/ui/restore/json.go, not guessed — a fast local restore
+    // never actually emits a `status` line to check this against (it
+    // finishes before the first progress tick), only `summary`.
+    Status {
+        #[serde(default)]
+        percent_done: f64,
+        #[serde(default)]
+        total_bytes: u64,
+        #[serde(default)]
+        bytes_restored: u64,
+        #[serde(default)]
+        files_restored: u64,
+    },
+    Summary {
+        #[serde(default)]
+        total_files: u64,
+        #[serde(default)]
+        files_restored: u64,
+        #[serde(default)]
+        total_bytes: u64,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// Result of a successful `restic restore`.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreSummary {
+    pub path: std::path::PathBuf,
+    pub total_files: u64,
+    pub files_restored: u64,
+    pub total_bytes: u64,
+}
+
+/// Restores `snapshot_id` (a full or short restic snapshot id) from
+/// `destination` into `scratch_dir`, reporting progress the same way
+/// [`backup`] does.
+///
+/// restic mirrors the snapshot's *original absolute path* under
+/// `--target` rather than flattening it — confirmed against a real
+/// restore, where backing up `/tmp/rrt/source/UDID` and restoring into
+/// `/tmp/rrt/scratch` produced `/tmp/rrt/scratch/tmp/rrt/source/UDID`, not
+/// `/tmp/rrt/scratch/UDID`. So this reads the snapshot's own recorded
+/// `paths[0]` (from `restic snapshots`) to compute where the restored
+/// files actually landed, rather than assuming a layout.
+pub async fn restore(
+    destination: &DestinationRecord,
+    snapshot_id: &str,
+    scratch_dir: &Path,
+    progress: Arc<dyn ProgressSink>,
+) -> Result<RestoreSummary, CradleError> {
+    let snapshots = list_snapshots(destination).await?;
+    let snapshot = snapshots
+        .iter()
+        .find(|s| s.id == snapshot_id || s.short_id == snapshot_id)
+        .ok_or_else(|| CradleError::Other(format!("no snapshot '{snapshot_id}' in this repository")))?;
+    let original_path = snapshot
+        .paths
+        .first()
+        .ok_or_else(|| CradleError::Other("snapshot has no recorded path".into()))?
+        .clone();
+
+    let scratch_arg = scratch_dir
+        .to_str()
+        .ok_or_else(|| CradleError::Other("scratch directory path is not valid UTF-8".into()))?
+        .to_string();
+
+    let mut summary: Option<RestoreSummary> = None;
+    run_streaming(
+        destination,
+        &[
+            "restore".to_string(),
+            snapshot.id.clone(),
+            "--target".to_string(),
+            scratch_arg,
+        ],
+        |line| match serde_json::from_str::<ResticRestoreMessage>(line) {
+            Ok(ResticRestoreMessage::Status {
+                percent_done,
+                total_bytes,
+                bytes_restored,
+                files_restored,
+            }) => {
+                progress.on_progress(bytes_restored, total_bytes, percent_done * 100.0);
+                progress.on_file("", files_restored as u32);
+            }
+            Ok(ResticRestoreMessage::Summary {
+                total_files,
+                files_restored,
+                total_bytes,
+            }) => {
+                summary = Some(RestoreSummary {
+                    path: std::path::PathBuf::new(),
+                    total_files,
+                    files_restored,
+                    total_bytes,
+                });
+            }
+            Ok(ResticRestoreMessage::Other) | Err(_) => {}
+        },
+    )
+    .await?;
+
+    let mut summary =
+        summary.ok_or_else(|| CradleError::Other("restic restore finished without a summary message".into()))?;
+    summary.path = scratch_dir.join(original_path.trim_start_matches('/'));
+    Ok(summary)
+}
+
 /// A retention policy for `restic forget --prune`. At least one field must
 /// be set — restic itself refuses to forget everything by accident, and so
 /// do we (see [`forget_and_prune`]).

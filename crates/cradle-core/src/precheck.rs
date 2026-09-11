@@ -94,3 +94,114 @@ fn pairing_error_message(e: &IdeviceError) -> String {
         other => format!("Pairing check failed: {other}"),
     }
 }
+
+/// Result of running the restore-only prechecks against the *target*
+/// device. Per CLAUDE.md: "Restore only: Find My iPhone disabled on
+/// target" / "Restore only: target iOS version >= backup's iOS version
+/// (read `Product Version` from `Info.plist`)".
+#[derive(Debug, Clone)]
+pub struct RestoreReport {
+    pub pairing_valid: bool,
+    pub pairing_message: Option<String>,
+    pub find_my_disabled: bool,
+    pub target_ios_version: Option<String>,
+    pub backup_ios_version: String,
+    pub target_ios_ok: bool,
+    pub device: Option<DeviceInfo>,
+}
+
+impl RestoreReport {
+    /// `true` only if every check passed. A restore must not start
+    /// otherwise — CLAUDE.md's non-negotiable #1 makes restore free and
+    /// unconditional, not unchecked.
+    pub fn passed(&self) -> bool {
+        self.pairing_valid && self.find_my_disabled && self.target_ios_ok
+    }
+}
+
+/// Runs the restore-only prechecks against `provider` (the *target*
+/// device restore will write to), comparing its iOS version against
+/// `backup_ios_version` (read by the caller from the backup's own
+/// `Info.plist` — see `restore.rs`).
+pub async fn run_restore(
+    provider: &dyn IdeviceProvider,
+    backup_ios_version: &str,
+) -> Result<RestoreReport, CradleError> {
+    match device::lockdown_session(provider).await {
+        Ok(mut lockdown) => {
+            let device = device::info(&mut lockdown).await.ok();
+
+            // Domain isn't in lockdownd's enumerable set but answers
+            // GetValue queries anyway — same pattern as WillEncrypt above.
+            // Confirmed against real-world usage reports (there is no
+            // official Apple documentation for this domain): `IsAssociated`
+            // is `true` when Find My is linked to an Apple ID on the
+            // device. Defaults to the *stricter* assumption (associated)
+            // if the query fails, since the failure mode of a false "off"
+            // here is a bricked restore attempt on a Find My-locked device.
+            let find_my_associated = lockdown
+                .get_value(Some("IsAssociated"), Some("com.apple.fmip"))
+                .await
+                .ok()
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(true);
+
+            let target_ios_version = device.as_ref().map(|d| d.ios_version.clone());
+            let target_ios_ok = target_ios_version
+                .as_deref()
+                .is_some_and(|target| ios_version_at_least(target, backup_ios_version));
+
+            Ok(RestoreReport {
+                pairing_valid: true,
+                pairing_message: None,
+                find_my_disabled: !find_my_associated,
+                target_ios_version,
+                backup_ios_version: backup_ios_version.to_string(),
+                target_ios_ok,
+                device,
+            })
+        }
+        Err(e) => Ok(RestoreReport {
+            pairing_valid: false,
+            pairing_message: Some(pairing_error_message(&e)),
+            find_my_disabled: false,
+            target_ios_version: None,
+            backup_ios_version: backup_ios_version.to_string(),
+            target_ios_ok: false,
+            device: None,
+        }),
+    }
+}
+
+/// Dotted-version comparison (`"26.6.1" >= "26.6"`), not string comparison
+/// (`"9.0" < "10.0"` lexically fails as strings but must hold as
+/// versions). Unparseable components read as 0.
+fn ios_version_at_least(target: &str, backup: &str) -> bool {
+    parse_version(target) >= parse_version(backup)
+}
+
+fn parse_version(v: &str) -> Vec<u32> {
+    v.split('.').map(|part| part.parse().unwrap_or(0)).collect()
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn longer_prefix_beats_shorter() {
+        assert!(ios_version_at_least("26.6.1", "26.6"));
+        assert!(!ios_version_at_least("26.6", "26.6.1"));
+    }
+
+    #[test]
+    fn numeric_not_lexical() {
+        assert!(ios_version_at_least("10.0", "9.0"));
+        assert!(!ios_version_at_least("9.0", "10.0"));
+    }
+
+    #[test]
+    fn equal_versions_pass() {
+        assert!(ios_version_at_least("18.1.2", "18.1.2"));
+    }
+}

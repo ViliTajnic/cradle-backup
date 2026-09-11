@@ -86,17 +86,18 @@ pub struct Catalog {
     conn: Connection,
 }
 
-/// What kind of operation a [`runs`] row records. Only `Backup` exists
-/// until M4 adds restore.
+/// What kind of operation a [`runs`] row records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunKind {
     Backup,
+    Restore,
 }
 
 impl RunKind {
     fn as_str(self) -> &'static str {
         match self {
             RunKind::Backup => "backup",
+            RunKind::Restore => "restore",
         }
     }
 }

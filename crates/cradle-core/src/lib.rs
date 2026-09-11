@@ -1,11 +1,13 @@
-//! Device protocol, prechecks, backup orchestration, the catalog, and the
-//! archive layer for Cradle.
+//! Device protocol, prechecks, backup orchestration, the catalog, the
+//! archive layer, and restore for Cradle.
 //!
-//! M0-M3 scope only (see `/ROADMAP.md`): connect to a device over
+//! M0-M4 scope only (see `/ROADMAP.md`): connect to a device over
 //! `mobilebackup2`, run prechecks, perform a backup into the canonical
 //! working directory with honest progress reporting, verify it, record it
-//! in a small local catalog, and archive it out to a restic-backed
-//! destination. No restore yet — that's M4.
+//! in a small local catalog, archive it out to a restic-backed
+//! destination, and restore it back onto a device — free and unconditional
+//! per CLAUDE.md's non-negotiable #1. No crypto layer yet (M5): manifest
+//! browsing and raw extraction of encrypted backups still aren't possible.
 
 pub mod archive;
 pub mod backup;
@@ -13,6 +15,7 @@ pub mod catalog;
 pub mod device;
 pub mod keychain;
 pub mod precheck;
+pub mod restore;
 pub mod verify;
 
 /// Errors that can occur anywhere in the Cradle core: device protocol
