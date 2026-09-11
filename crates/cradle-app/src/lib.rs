@@ -29,6 +29,7 @@ pub fn run() {
             commands::get_history,
             commands::list_destinations,
             commands::add_destination,
+            commands::remove_destination,
             commands::run_archive,
         ])
         .run(tauri::generate_context!())

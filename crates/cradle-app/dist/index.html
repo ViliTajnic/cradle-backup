@@ -387,10 +387,39 @@ function renderDestinations(destinations) {
     return;
   }
   el.className = "";
-  const rows = destinations.map(d => `
-    <tr><td>${d.name}</td><td>${d.kind}</td><td>${d.uri}</td></tr>
-  `).join("");
-  el.innerHTML = `<table><thead><tr><th>Name</th><th>Kind</th><th>URI</th></tr></thead><tbody>${rows}</tbody></table>`;
+  el.innerHTML = "";
+
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>Name</th><th>Kind</th><th>URI</th><th></th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  for (const d of destinations) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${d.name}</td><td>${d.kind}</td><td>${d.uri}</td>`;
+    const actionCell = document.createElement("td");
+    const removeBtn = document.createElement("button");
+    removeBtn.textContent = "Remove";
+    removeBtn.onclick = () => removeDestination(d.name);
+    actionCell.appendChild(removeBtn);
+    tr.appendChild(actionCell);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  el.appendChild(table);
+}
+
+async function removeDestination(name) {
+  const confirmed = confirm(
+    `Remove destination "${name}"?\n\nThis does not delete the repository itself — only ` +
+    `Cradle's record of it and its stored password. If you don't have the password recorded ` +
+    `elsewhere, Cradle won't be able to get back into that repository after this.`
+  );
+  if (!confirmed) return;
+  try {
+    await invoke("remove_destination", { name });
+    await refreshDestinations();
+  } catch (e) {
+    alert("Could not remove destination: " + e);
+  }
 }
 
 async function refreshDestinations() {

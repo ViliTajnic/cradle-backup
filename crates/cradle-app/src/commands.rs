@@ -389,6 +389,25 @@ pub async fn add_destination(name: String, kind: String, uri: String) -> Result<
     Ok(())
 }
 
+/// Forgets a destination — mirrors `cradle destination remove`. Does not
+/// touch the restic repository itself, only Cradle's record of it and its
+/// Keychain-stored password (see that command's own doc for the
+/// consequence: without the password recorded elsewhere, Cradle can't get
+/// back into that repository after this).
+#[tauri::command]
+pub async fn remove_destination(name: String) -> Result<(), String> {
+    let catalog = open_catalog()?;
+    let destination = catalog
+        .destination_by_name(&name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("No destination named '{name}'."))?;
+    catalog
+        .delete_destination(destination.id)
+        .map_err(|e| e.to_string())?;
+    let _ = keychain::delete(&destination.credential_ref);
+    Ok(())
+}
+
 #[derive(Serialize, Clone)]
 pub struct ArchiveSummary {
     snapshot_id: String,

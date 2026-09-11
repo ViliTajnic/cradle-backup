@@ -197,6 +197,18 @@ enum DestinationCommand {
     },
     /// List configured destinations.
     List,
+    /// Forgets a destination — removes it from the catalog and deletes
+    /// its Keychain-stored password.
+    ///
+    /// Does *not* touch the restic repository itself; the actual backed-up
+    /// data at its URI is untouched. But since Cradle generated and only
+    /// Cradle stored that repository's password, removing the destination
+    /// means Cradle can no longer archive to or read from it unless you
+    /// have the password recorded elsewhere.
+    Remove {
+        #[arg(long)]
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -663,6 +675,17 @@ async fn run_destination(command: DestinationCommand, catalog_path: PathBuf) -> 
             for d in destinations {
                 println!("{:<12} {:<8} {}", d.name, d.kind, d.uri);
             }
+            Ok(())
+        }
+        DestinationCommand::Remove { name } => {
+            let destination = resolve_destination(&catalog, &name)?;
+            catalog.delete_destination(destination.id)?;
+            let _ = keychain::delete(&destination.credential_ref);
+            println!(
+                "Removed destination '{name}'. The repository at {} is untouched — only \
+                 Cradle's record of it and its stored password are gone.",
+                destination.uri
+            );
             Ok(())
         }
     }

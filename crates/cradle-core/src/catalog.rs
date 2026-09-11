@@ -451,6 +451,18 @@ impl Catalog {
             .map_err(CradleError::from)
     }
 
+    /// Removes a destination's catalog row. Does *not* touch the restic
+    /// repository itself — the actual backed-up data at `uri` is
+    /// untouched, only Cradle's record of the destination goes away.
+    /// Callers are expected to also delete the Keychain-stored password
+    /// (this doesn't do that itself, since credential deletion goes
+    /// through `keychain.rs`, not the catalog).
+    pub fn delete_destination(&self, id: i64) -> Result<(), CradleError> {
+        self.conn
+            .execute("DELETE FROM destinations WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// All configured destinations.
     pub fn list_destinations(&self) -> Result<Vec<DestinationRecord>, CradleError> {
         let mut stmt = self
@@ -651,5 +663,17 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn delete_destination_removes_it() {
+        let cat = open_temp();
+        let id = cat.create_destination("nas", "nas", "/tmp/repo", "cradle-destination-nas").unwrap();
+        assert!(cat.destination_by_name("nas").unwrap().is_some());
+
+        cat.delete_destination(id).unwrap();
+
+        assert!(cat.destination_by_name("nas").unwrap().is_none());
+        assert!(cat.list_destinations().unwrap().is_empty());
     }
 }
