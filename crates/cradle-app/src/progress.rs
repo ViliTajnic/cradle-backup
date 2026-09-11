@@ -92,6 +92,18 @@ impl ProgressSink for TauriProgress {
     }
 
     fn on_attention_needed(&self, needed: bool) {
+        // An in-app banner alone is easy to miss if the user has switched
+        // windows or stepped away — exactly the condition under which
+        // iOS's own passcode/Face ID timeout causes a real backup to
+        // restart as full. Notification Center is a much better shot at
+        // actually reaching them in time. See `cradle_core::notify`'s
+        // module doc for the real-device story behind this.
+        if needed {
+            cradle_core::notify::alert(
+                "Cradle needs your attention",
+                "Unlock your iPhone/iPad now — it's asking for Face ID or your passcode to continue the backup.",
+            );
+        }
         if let Some(event) = self.attention_event {
             let _ = self.app.emit(event, needed);
         }

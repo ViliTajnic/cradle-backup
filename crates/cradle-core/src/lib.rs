@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod crypto;
 pub mod device;
 pub mod keychain;
+pub mod notify;
 pub mod power;
 pub mod precheck;
 pub mod restore;
@@ -54,9 +55,16 @@ pub enum CradleError {
     /// [`backup::run_resilient`] retries on it: a real ~75GB backup hit
     /// this after 53 minutes of continuous transfer, traced to the Mac
     /// running low on free memory, not anything wrong with the backup
-    /// data itself. Retrying is cheap — the working directory's partial
-    /// state lets the device compute an incremental instead of starting
-    /// over.
+    /// data itself.
+    ///
+    /// Retrying costs nothing extra to *write* — `working_root` is
+    /// untouched either way — but don't assume it makes the retry itself
+    /// fast: confirmed against a real device, MobileBackup2 only computes
+    /// an incremental against the *last successfully finished* backup, so
+    /// an attempt that gets interrupted before finishing (this error,
+    /// [`Self::DeviceLocked`], anything) can make the device discard the
+    /// in-progress manifest and redo the whole transfer as full on the
+    /// next attempt, no matter how much data is already sitting on disk.
     #[error(
         "the Mac had a host-side I/O error while writing the backup (device error 104) — this \
          is usually caused by low system memory or a disk/USB hiccup on this computer, not a \

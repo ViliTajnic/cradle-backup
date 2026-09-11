@@ -80,6 +80,14 @@ impl ProgressSink for TerminalProgress {
 
     fn on_attention_needed(&self, needed: bool) {
         if needed {
+            // A terminal line alone is easy to miss once the user isn't
+            // watching the window — see `cradle_core::notify`'s module doc
+            // for the real-device story: this exact gap is why a backup
+            // restarted as a full transfer more than once in a row.
+            cradle_core::notify::alert(
+                "Cradle needs your attention",
+                "Unlock your iPhone/iPad now — it's asking for Face ID or your passcode to continue the backup.",
+            );
             eprintln!(
                 "\n>>> Look at your device now — enter your passcode (or use Face ID/Touch ID) \
                  to let the backup continue. <<<"
