@@ -233,10 +233,34 @@ authorization-prompt hang documented in M3 — use `cradle password
 set/forget` to inspect or clean up Cradle's own Keychain entries, never
 the `security` CLI directly.
 
-## M6 — CLI v1.0
+## M6 — CLI v1.0 ✅ polish pass done
 
 Ship it. Complete, supported, the free tier's full interface.
 Not a debug tool.
+
+M0-M5 already built the full functional surface, so this was a
+completeness/consistency pass over the existing CLI rather than new
+features:
+
+- Audited every `.unwrap()`/`.expect()` reachable from a real command path
+  (as opposed to `#[cfg(test)]` code) — all three are provably safe by
+  construction (fixed-size slice conversions after an explicit length
+  check; `Stdio::piped()` guaranteeing `child.stdout`/`stderr` are `Some`),
+  not "should be fine" guesses.
+- Reordered `Command`'s variants to match an actual workflow (discover →
+  backup → archive → restore → password/decrypt utilities) instead of the
+  order they happened to get built in — that order drives `--help`'s
+  command list.
+- Found and fixed a real, systematic gap: roughly a dozen `--flag`s across
+  `history`, `password`, `destination add`, and every `archive` subcommand
+  had no doc comment, so `--help` printed their name with a blank
+  description. Caught by actually reading `--help` output for every
+  subcommand, not by inspection — several looked fine in the source until
+  rendered.
+- Added `cradle completions <shell>` (bash/zsh/fish/elvish/powershell via
+  `clap_complete`), handled before the catalog path is resolved since
+  printing a completion script is fully offline and has no reason to
+  depend on, or fail because of, something it has nothing to do with.
 
 ## M7 — Tauri UI
 

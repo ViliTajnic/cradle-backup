@@ -1,5 +1,5 @@
 //! Cradle CLI — M0 connect/precheck/backup, M1 verification gate, M2
-//! catalog, M3 archive layer, M4 restore, M5 decryption.
+//! catalog, M3 archive layer, M4 restore, M5 decryption, M6 polish.
 //!
 //! Per CLAUDE.md, the CLI is not a debug tool: it ships, it is supported,
 //! and it is the free tier's complete interface. Restore in particular is
@@ -11,7 +11,8 @@ mod progress;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use cradle_core::CradleError;
 use cradle_core::catalog::{ArchiveState, Catalog, DestinationRecord, DeviceRecord, RunKind, RunStatus};
 use cradle_core::crypto::Keybag;
@@ -53,44 +54,27 @@ enum Command {
     /// Reads only the local catalog database — the device doesn't need to
     /// be attached.
     History {
+        /// Device UDID.
         #[arg(long)]
         udid: String,
     },
-    /// Manage a device's backup password in the macOS Keychain.
-    ///
-    /// Storing it unlocks the real `Manifest.db` integrity check on
-    /// `cradle backup` (see `verify.rs`) instead of the reduced one, and
-    /// is needed for `cradle decrypt`. This is the password set on the
-    /// *device* (Settings/Finder's "Encrypted Backup") — Cradle never
-    /// generates or changes it.
-    Password {
+    /// Manage archive destinations (restic repositories).
+    Destination {
         #[command(subcommand)]
-        command: PasswordCommand,
+        command: DestinationCommand,
     },
-    /// Decrypts a single file from a backup using its stored password.
+    /// Archive a verified snapshot out to a destination.
     ///
-    /// Needs the `Manifest.db` row's own `EncryptionKey` for the target
-    /// file, which nothing in Cradle currently looks up by domain/path —
-    /// pass `--encryption-key <hex>` directly until manifest browsing
-    /// exists (see `crypto.rs`'s module doc for that gap).
-    Decrypt {
-        #[arg(long)]
-        udid: Option<String>,
-        #[arg(long, default_value = "working")]
-        working_dir: PathBuf,
-        /// Path (relative to the backup root) to the encrypted file.
-        #[arg(long)]
-        input: PathBuf,
-        /// Where to write the decrypted output.
-        #[arg(long)]
-        output: PathBuf,
-        /// The file's wrapped encryption key, hex-encoded — from
-        /// `Manifest.db`'s `Files.file` blob's `EncryptionKey` field.
-        #[arg(long)]
-        encryption_key: String,
+    /// Per CLAUDE.md's architecture: "Archiving copies out of it [the
+    /// working directory]" — never in place, never touching the source.
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommand,
     },
-    /// Restores a backup onto a device. Free, unconditional, forever — no
-    /// license check, no network call (CLAUDE.md non-negotiable #1).
+    /// Restore a backup onto a device.
+    ///
+    /// Free, unconditional, forever — no license check, no network call
+    /// (CLAUDE.md non-negotiable #1).
     Restore {
         /// Target device UDID — the device being restored *onto*.
         #[arg(long)]
@@ -124,17 +108,47 @@ enum Command {
         #[arg(long)]
         system_files: bool,
     },
-    /// Manage archive destinations (restic repositories).
-    Destination {
+    /// Manage a device's backup password in the macOS Keychain.
+    ///
+    /// Storing it unlocks the real `Manifest.db` integrity check on
+    /// `cradle backup` (see `verify.rs`) instead of the reduced one, and
+    /// is needed for `cradle decrypt`. This is the password set on the
+    /// *device* (Settings/Finder's "Encrypted Backup") — Cradle never
+    /// generates or changes it.
+    Password {
         #[command(subcommand)]
-        command: DestinationCommand,
+        command: PasswordCommand,
     },
-    /// Archive a verified snapshot out of the working directory (see
-    /// CLAUDE.md: "Archiving copies out of it").
-    Archive {
-        #[command(subcommand)]
-        command: ArchiveCommand,
+    /// Decrypt a single file from a backup, given its encryption key.
+    ///
+    /// Needs the `Manifest.db` row's own `EncryptionKey` for the target
+    /// file, which nothing in Cradle currently looks up by domain/path —
+    /// pass `--encryption-key <hex>` directly until manifest browsing
+    /// exists (see `crypto.rs`'s module doc for that gap).
+    Decrypt {
+        /// Device UDID. Required when more than one device is attached.
+        #[arg(long)]
+        udid: Option<String>,
+        /// Where the backup lives; `<root>/<UDID>/` is read underneath it.
+        #[arg(long, default_value = "working")]
+        working_dir: PathBuf,
+        /// Path (relative to the backup root) to the encrypted file.
+        #[arg(long)]
+        input: PathBuf,
+        /// Where to write the decrypted output.
+        #[arg(long)]
+        output: PathBuf,
+        /// The file's wrapped encryption key, hex-encoded — from
+        /// `Manifest.db`'s `Files.file` blob's `EncryptionKey` field.
+        #[arg(long)]
+        encryption_key: String,
     },
+    /// Print a shell completion script to stdout.
+    ///
+    /// e.g. `cradle completions zsh > ~/.zfunc/_cradle` (with `~/.zfunc` on
+    /// `fpath` and `compinit` run), or `cradle completions bash | sudo tee
+    /// /etc/bash_completion.d/cradle`.
+    Completions { shell: Shell },
 }
 
 #[derive(Subcommand)]
@@ -143,13 +157,17 @@ enum PasswordCommand {
     /// `--password` isn't given (preferred — `--password` is visible in
     /// shell history and process listings for as long as this runs).
     Set {
+        /// Device UDID.
         #[arg(long)]
         udid: String,
+        /// The backup password. Prefer the hidden prompt (omit this) —
+        /// see the command's own doc for why.
         #[arg(long)]
         password: Option<String>,
     },
     /// Remove a device's stored backup password.
     Forget {
+        /// Device UDID.
         #[arg(long)]
         udid: String,
     },
@@ -171,6 +189,8 @@ enum DestinationCommand {
         /// kind is wrapped identically; see the `archive` module.
         #[arg(long, default_value = "local")]
         kind: String,
+        /// Restic-compatible repository location — see this command's
+        /// own doc above for examples.
         #[arg(long)]
         uri: String,
     },
@@ -182,8 +202,10 @@ enum DestinationCommand {
 enum ArchiveCommand {
     /// Archives the latest verified snapshot for a device to a destination.
     Run {
+        /// Device UDID.
         #[arg(long)]
         udid: String,
+        /// Destination name (see `cradle destination list`).
         #[arg(long)]
         destination: String,
         /// Must match the `--working-dir` the snapshot was backed up
@@ -195,6 +217,7 @@ enum ArchiveCommand {
     /// Lists snapshots actually stored at a destination's repository
     /// (restic's own view, not the local catalog's `archives` table).
     List {
+        /// Destination name (see `cradle destination list`).
         #[arg(long)]
         destination: String,
     },
@@ -203,14 +226,19 @@ enum ArchiveCommand {
     /// At least one `--keep-*` flag is required — restic (and Cradle)
     /// refuse to guess at "keep nothing" by omission.
     Prune {
+        /// Destination name (see `cradle destination list`).
         #[arg(long)]
         destination: String,
+        /// Keep the last N snapshots, regardless of age.
         #[arg(long)]
         keep_last: Option<u32>,
+        /// Keep the most recent snapshot from each of the last N days.
         #[arg(long)]
         keep_daily: Option<u32>,
+        /// Keep the most recent snapshot from each of the last N weeks.
         #[arg(long)]
         keep_weekly: Option<u32>,
+        /// Keep the most recent snapshot from each of the last N months.
         #[arg(long)]
         keep_monthly: Option<u32>,
     },
@@ -218,6 +246,7 @@ enum ArchiveCommand {
     /// integrity restic already confirms during every `archive run` —
     /// see `archive::check`'s doc comment.
     Check {
+        /// Destination name (see `cradle destination list`).
         #[arg(long)]
         destination: String,
     },
@@ -230,6 +259,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Printing a completion script is fully offline, so it's handled
+    // before the catalog path (below) is resolved — no reason for it to
+    // depend on, or fail because of, something it has nothing to do with.
+    let Command::Completions { shell } = cli.command else {
+        return run_command(cli).await;
+    };
+    clap_complete::generate(shell, &mut Cli::command(), "cradle", &mut std::io::stdout());
+    Ok(())
+}
+
+async fn run_command(cli: Cli) -> anyhow::Result<()> {
     let catalog_path = match cli.catalog {
         Some(path) => path,
         None => Catalog::default_path()?,
@@ -276,6 +317,8 @@ async fn main() -> anyhow::Result<()> {
             output,
             encryption_key,
         } => run_decrypt(udid, working_dir, input, output, encryption_key).await,
+        // Handled in `main` before `run_command` is ever called.
+        Command::Completions { .. } => unreachable!(),
     }
 }
 

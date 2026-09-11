@@ -6,12 +6,12 @@ real progress instead of an indeterminate spinner.
 
 See [`CLAUDE.md`](./CLAUDE.md) for the project's non-negotiables and
 architecture, and [`ROADMAP.md`](./ROADMAP.md) for the milestone plan. This
-repo is at **M5** — protocol spike + verification gate + catalog + archive
-layer + restore + backup decryption, partially verified against real
-hardware and real infrastructure. Building has continued through M7 with a
-real backup-and-restore-to-another-device test deliberately deferred until
-the whole stack exists — see `ROADMAP.md` for exactly what has and hasn't
-been exercised at each milestone.
+repo is at **M6** — protocol spike + verification gate + catalog + archive
+layer + restore + backup decryption + a CLI polish pass, partially
+verified against real hardware and real infrastructure. Building has
+continued through M7 with a real backup-and-restore-to-another-device test
+deliberately deferred until the whole stack exists — see `ROADMAP.md` for
+exactly what has and hasn't been exercised at each milestone.
 
 ## Status
 
@@ -55,7 +55,7 @@ still falls back to the reduced check from M1's original build.
 - `crates/cradle-cli` — the `cradle` binary: `cradle devices`,
   `cradle backup`, `cradle history`, `cradle destination add/list`,
   `cradle archive run/list/prune/check`, `cradle restore`,
-  `cradle password set/forget`, `cradle decrypt`.
+  `cradle password set/forget`, `cradle decrypt`, `cradle completions`.
 
 ## Building
 
@@ -89,6 +89,8 @@ cradle restore --udid <UDID> --from-archive nas --restic-snapshot <id>
 
 cradle password set --udid <UDID>           # store the backup password (hidden prompt)
 cradle decrypt --udid <UDID> --input <relative-path> --output <file> --encryption-key <hex>
+
+cradle completions zsh > ~/.zfunc/_cradle    # shell completions (bash/zsh/fish/elvish/powershell)
 ```
 
 `working/` is the canonical working directory (see `CLAUDE.md`): it is
