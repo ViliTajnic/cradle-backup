@@ -9,3 +9,5 @@ crates/cradle-app/gen/
 /working/
 
 .DS_Store
+CLAUDE.md
+ROADMAP.md
