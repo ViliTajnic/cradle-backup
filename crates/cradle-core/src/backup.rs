@@ -420,6 +420,9 @@ pub async fn run(
         if number == Some(208) {
             return Err(CradleError::DeviceLocked);
         }
+        if number == Some(104) {
+            return Err(CradleError::HostIoError);
+        }
         let hint = number.and_then(device_error_hint);
         let message = match (number, hint) {
             (Some(n), Some(hint)) => format!("device backup error {n}: {hint}"),
@@ -449,26 +452,62 @@ pub async fn run(
 pub const LOCK_RETRY_ATTEMPTS: u32 = 5;
 pub const LOCK_RETRY_DELAY: Duration = Duration::from_secs(10);
 
-/// Runs [`run`], automatically retrying up to [`LOCK_RETRY_ATTEMPTS`] times
-/// if the device reports [`CradleError::DeviceLocked`]. `on_retry(attempt,
-/// max_attempts)` fires before each wait so a caller can tell the user to
-/// unlock the device — it's already too late for `on_attention_needed` to
-/// have caught this one.
+/// How many times [`run_resilient`] retries a backup that failed with
+/// [`CradleError::HostIoError`] (MBErrorDomain 104), and how long it waits
+/// between tries. Fewer attempts and a longer delay than the lock retry:
+/// unlike a locked screen, which resolves the moment the user looks at
+/// their phone, a host-side I/O error needs the underlying condition (low
+/// memory, a disk hiccup) to actually clear, and retrying into the same
+/// pressure repeatedly wastes an hour-long transfer's worth of time for no
+/// gain.
+pub const HOST_IO_RETRY_ATTEMPTS: u32 = 3;
+pub const HOST_IO_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Which condition [`run_resilient`] is retrying, passed to its `on_retry`
+/// callback so the caller can show a message that names the actual cause
+/// instead of a generic "retrying...".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReason {
+    /// MBErrorDomain 208 — the device needs the user to unlock it.
+    DeviceLocked,
+    /// MBErrorDomain 104 — a host-side I/O error, usually low memory.
+    HostIo,
+}
+
+/// Runs [`run`], automatically retrying on [`CradleError::DeviceLocked`]
+/// (up to [`LOCK_RETRY_ATTEMPTS`] times) and [`CradleError::HostIoError`]
+/// (up to [`HOST_IO_RETRY_ATTEMPTS`] times). `on_retry(reason, attempt,
+/// max_attempts)` fires before each wait so a caller can tell the user
+/// what's happening — for a lock, it's already too late for
+/// `on_attention_needed` to have caught this one; for a host I/O error,
+/// there was no earlier signal at all.
+///
+/// Both retries are cheap by construction, not just in theory: neither
+/// touches `working_root`, so the device still finds its own prior
+/// `Status.plist`/`Manifest.plist`/`Manifest.db` there on the next attempt
+/// and computes an incremental rather than starting the whole backup over
+/// (see this module's own doc comment on why that's true).
 pub async fn run_resilient(
     provider: &dyn IdeviceProvider,
     working_root: &Path,
     force_full: bool,
     progress: Arc<dyn ProgressSink>,
-    on_retry: impl Fn(u32, u32),
+    on_retry: impl Fn(RetryReason, u32, u32),
 ) -> Result<Outcome, CradleError> {
-    let mut attempt = 1;
+    let mut lock_attempt = 1;
+    let mut host_io_attempt = 1;
     loop {
         match run(provider, working_root, force_full, progress.clone()).await {
             Ok(outcome) => return Ok(outcome),
-            Err(CradleError::DeviceLocked) if attempt < LOCK_RETRY_ATTEMPTS => {
-                on_retry(attempt, LOCK_RETRY_ATTEMPTS);
+            Err(CradleError::DeviceLocked) if lock_attempt < LOCK_RETRY_ATTEMPTS => {
+                on_retry(RetryReason::DeviceLocked, lock_attempt, LOCK_RETRY_ATTEMPTS);
                 tokio::time::sleep(LOCK_RETRY_DELAY).await;
-                attempt += 1;
+                lock_attempt += 1;
+            }
+            Err(CradleError::HostIoError) if host_io_attempt < HOST_IO_RETRY_ATTEMPTS => {
+                on_retry(RetryReason::HostIo, host_io_attempt, HOST_IO_RETRY_ATTEMPTS);
+                tokio::time::sleep(HOST_IO_RETRY_DELAY).await;
+                host_io_attempt += 1;
             }
             Err(e) => return Err(e),
         }

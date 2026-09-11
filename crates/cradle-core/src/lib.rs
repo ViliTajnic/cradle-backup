@@ -40,13 +40,30 @@ pub enum CradleError {
     Catalog(#[from] rusqlite::Error),
 
     /// MBErrorDomain 208. Split out from [`Self::Other`] because it's
-    /// recoverable: see [`backup::run_resilient`], which retries on exactly
-    /// this variant.
+    /// recoverable: see [`backup::run_resilient`], which retries on this
+    /// variant (and on [`Self::HostIoError`]).
     #[error(
         "the device was locked when iOS needed to access protected data — unlock it and keep \
          it unlocked and awake for the whole backup"
     )]
     DeviceLocked,
+
+    /// MBErrorDomain 104 ("computer-side errors during backup" — the Mac
+    /// itself failed to read or write a backup file mid-transfer). Split
+    /// out from [`Self::Other`], like [`Self::DeviceLocked`], because
+    /// [`backup::run_resilient`] retries on it: a real ~75GB backup hit
+    /// this after 53 minutes of continuous transfer, traced to the Mac
+    /// running low on free memory, not anything wrong with the backup
+    /// data itself. Retrying is cheap — the working directory's partial
+    /// state lets the device compute an incremental instead of starting
+    /// over.
+    #[error(
+        "the Mac had a host-side I/O error while writing the backup (device error 104) — this \
+         is usually caused by low system memory or a disk/USB hiccup on this computer, not a \
+         problem with the device; Cradle will retry automatically, but free up memory if it \
+         keeps happening"
+    )]
+    HostIoError,
 
     #[error("{0}")]
     Other(String),

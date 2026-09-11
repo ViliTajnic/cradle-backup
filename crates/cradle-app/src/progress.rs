@@ -24,6 +24,10 @@ pub const BACKUP_PROGRESS_EVENT: &str = "backup-progress";
 pub const BACKUP_ATTENTION_EVENT: &str = "backup-attention";
 /// Event name for an archive run's progress.
 pub const ARCHIVE_PROGRESS_EVENT: &str = "archive-progress";
+/// Event name for a restore run's progress. Restore never fires an
+/// attention event: unlike `backup::run`, `restore::run` doesn't watch the
+/// device's notification proxy for the on-screen passcode/Face ID prompt.
+pub const RESTORE_PROGRESS_EVENT: &str = "restore-progress";
 
 #[derive(Serialize, Clone)]
 struct ProgressPayload {
@@ -54,6 +58,15 @@ impl TauriProgress {
         Self {
             app,
             progress_event: ARCHIVE_PROGRESS_EVENT,
+            attention_event: None,
+            files: AtomicU32::new(0),
+        }
+    }
+
+    pub fn for_restore(app: AppHandle) -> Self {
+        Self {
+            app,
+            progress_event: RESTORE_PROGRESS_EVENT,
             attention_event: None,
             files: AtomicU32::new(0),
         }

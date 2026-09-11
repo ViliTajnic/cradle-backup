@@ -194,6 +194,29 @@
       <div id="backup-result"></div>
     </section>
 
+    <section class="panel" id="restore-panel" style="display:none;">
+      <h2>Restore — <span id="restore-device-name"></span></h2>
+      <div style="display:flex; gap:16px; align-items:flex-end; flex-wrap:wrap; margin-bottom:10px;">
+        <div>
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">Restore backup from</label>
+          <select id="restore-source" style="font:inherit; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--text); min-width:240px;"></select>
+        </div>
+        <label style="display:flex; align-items:center; gap:6px; font-size:12px; padding-bottom:7px;">
+          <input type="checkbox" id="restore-reboot" checked /> Reboot device when done
+        </label>
+      </div>
+      <div id="restore-confirm-area"></div>
+      <div class="progress-track"><div id="restore-progress-fill" class="progress-fill"></div></div>
+      <div class="stat-grid">
+        <div class="stat"><div id="restore-stat-pct" class="value">—</div><div class="label">Progress</div></div>
+        <div class="stat"><div id="restore-stat-files" class="value">0</div><div class="label">Files</div></div>
+        <div class="stat"><div id="restore-stat-rate" class="value">—</div><div class="label">Rate</div></div>
+        <div class="stat"><div id="restore-stat-eta" class="value">—</div><div class="label">ETA</div></div>
+      </div>
+      <div id="restore-status" class="status-line"></div>
+      <div id="restore-result"></div>
+    </section>
+
     <section class="panel" id="archive-panel" style="display:none;">
       <h2>Archive — <span id="archive-device-name"></span></h2>
       <div class="progress-track"><div id="archive-progress-fill" class="progress-fill"></div></div>
@@ -353,6 +376,12 @@ function renderDevices(devices) {
     archiveBtn.disabled = !knownDestinations.length;
     archiveBtn.onclick = () => startArchive(d, destSelect.value);
     right.appendChild(archiveBtn);
+
+    const restoreBtn = document.createElement("button");
+    restoreBtn.textContent = "Restore";
+    restoreBtn.disabled = !d.reachable;
+    restoreBtn.onclick = () => openRestorePanel(d);
+    right.appendChild(restoreBtn);
 
     const histBtn = document.createElement("button");
     histBtn.textContent = "History";
@@ -564,6 +593,143 @@ async function startBackup(device) {
   }
 }
 
+let restoreStart = null;
+
+// Opens the restore panel for `device` (the *target* — the device being
+// restored onto) and populates the source picker with every backup Cradle
+// knows about that's actually present in the working directory right now,
+// defaulting to the device's own backup but allowing any other one —
+// that's cross-device migration onto a new/replacement device.
+async function openRestorePanel(device) {
+  document.getElementById("restore-panel").style.display = "block";
+  document.getElementById("restore-device-name").textContent = device.name ?? device.udid;
+  document.getElementById("restore-progress-fill").style.width = "0%";
+  document.getElementById("restore-stat-pct").textContent = "—";
+  document.getElementById("restore-stat-files").textContent = "0";
+  document.getElementById("restore-stat-rate").textContent = "—";
+  document.getElementById("restore-stat-eta").textContent = "—";
+  document.getElementById("restore-status").textContent = "";
+  document.getElementById("restore-result").innerHTML = "";
+
+  const select = document.getElementById("restore-source");
+  select.innerHTML = "";
+  select.disabled = true;
+  const loading = document.createElement("option");
+  loading.textContent = "Loading backups…";
+  select.appendChild(loading);
+
+  let sources = [];
+  try {
+    sources = await invoke("list_restore_sources", { workingDir: getWorkingDir() || null });
+  } catch (e) {
+    select.innerHTML = "";
+    const err = document.createElement("option");
+    err.textContent = "Error listing backups";
+    select.appendChild(err);
+    document.getElementById("restore-status").textContent = "Error: " + e;
+    buildRestoreConfirm(device, false);
+    return;
+  }
+
+  const available = sources.filter((s) => s.has_local_backup);
+  select.innerHTML = "";
+  if (!available.length) {
+    const opt = document.createElement("option");
+    opt.textContent = "No local backups found";
+    select.appendChild(opt);
+    document.getElementById("restore-status").textContent =
+      "No local backup found for any known device — back one up first, or point Working Directory at where an existing backup lives.";
+  } else {
+    for (const s of available) {
+      const opt = document.createElement("option");
+      opt.value = s.udid;
+      const own = s.udid === device.udid;
+      opt.textContent = own
+        ? `${s.name || s.udid} (this device's own backup)`
+        : `${s.name || s.udid} — iOS ${s.ios_version} (cross-device migration)`;
+      select.appendChild(opt);
+    }
+    const ownIndex = available.findIndex((s) => s.udid === device.udid);
+    select.selectedIndex = ownIndex >= 0 ? ownIndex : 0;
+    select.disabled = false;
+  }
+
+  buildRestoreConfirm(device, available.length > 0);
+}
+
+// Click-to-confirm, same pattern as buildRemoveControl and for the same
+// reason (window.confirm() is silently swallowed by Tauri's WKWebView) —
+// doubly warranted here since a restore overwrites the target device's
+// current contents.
+function buildRestoreConfirm(device, enabled) {
+  const area = document.getElementById("restore-confirm-area");
+
+  const startBtn = document.createElement("button");
+  startBtn.className = "primary";
+  startBtn.textContent = "Restore";
+  startBtn.disabled = !enabled;
+
+  const renderIdle = () => {
+    area.innerHTML = "";
+    area.appendChild(startBtn);
+  };
+
+  startBtn.onclick = () => {
+    const sourceUdid = document.getElementById("restore-source").value;
+    area.innerHTML = "";
+
+    const warning = document.createElement("div");
+    warning.className = "result bad";
+    warning.style.marginBottom = "8px";
+    warning.textContent =
+      sourceUdid === device.udid
+        ? "This erases the device's current contents and replaces them with the selected backup. Continue?"
+        : "This erases the target device's current contents and replaces them with the other device's backup. Continue?";
+
+    const confirmBtn = document.createElement("button");
+    confirmBtn.textContent = "Confirm Restore";
+    confirmBtn.style.borderColor = "var(--bad)";
+    confirmBtn.style.color = "var(--bad)";
+    confirmBtn.onclick = () => startRestore(device);
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.onclick = renderIdle;
+
+    area.appendChild(warning);
+    area.appendChild(confirmBtn);
+    area.appendChild(cancelBtn);
+  };
+
+  renderIdle();
+}
+
+async function startRestore(device) {
+  const sourceUdid = document.getElementById("restore-source").value;
+  const reboot = document.getElementById("restore-reboot").checked;
+  document.getElementById("restore-confirm-area").innerHTML = "";
+  document.getElementById("restore-status").textContent = "Starting…";
+  document.getElementById("restore-result").innerHTML = "";
+  restoreStart = performance.now();
+  try {
+    const summary = await invoke("run_restore", {
+      udid: device.udid,
+      sourceUdid,
+      workingDir: getWorkingDir() || null,
+      reboot,
+      systemFiles: false,
+    });
+    document.getElementById("restore-result").innerHTML =
+      `<div class="result ok">Restore complete on ${summary.target_udid}` +
+      (summary.rebooted ? " — device will reboot.</div>" : ".</div>");
+    document.getElementById("restore-status").textContent = "Done.";
+    refreshDevices();
+  } catch (e) {
+    document.getElementById("restore-result").innerHTML = `<div class="result bad">${e}</div>`;
+    document.getElementById("restore-status").textContent = "Failed.";
+  }
+}
+
 async function showHistory(device) {
   selectedUdid = device.udid;
   document.getElementById("history-device-name").textContent = device.name ?? device.udid;
@@ -617,6 +783,7 @@ function applyProgress(idPrefix, payload, start) {
 
 listen("backup-progress", (event) => applyProgress("", event.payload, backupStart));
 listen("archive-progress", (event) => applyProgress("archive-", event.payload, archiveStart));
+listen("restore-progress", (event) => applyProgress("restore-", event.payload, restoreStart));
 
 listen("backup-attention", (event) => {
   document.getElementById("attention").classList.toggle("show", event.payload === true);
@@ -626,10 +793,16 @@ listen("backup-status", (event) => {
   document.getElementById("backup-status").textContent = event.payload;
 });
 
+listen("restore-status", (event) => {
+  document.getElementById("restore-status").textContent = event.payload;
+});
+
 listen("backup-retry", (event) => {
-  const { attempt, max } = event.payload;
+  const { reason, attempt, max } = event.payload;
   document.getElementById("backup-status").textContent =
-    `Device locked mid-backup — unlock it now. Retrying (attempt ${attempt}/${max})…`;
+    reason === "host_io"
+      ? `Host-side I/O error (usually low memory on this Mac) — retrying (attempt ${attempt}/${max})…`
+      : `Device locked mid-backup — unlock it now. Retrying (attempt ${attempt}/${max})…`;
 });
 
 document.getElementById("refresh").onclick = refreshDevices;

@@ -31,6 +31,8 @@ pub fn run() {
             commands::add_destination,
             commands::remove_destination,
             commands::run_archive,
+            commands::list_restore_sources,
+            commands::run_restore,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Cradle app");

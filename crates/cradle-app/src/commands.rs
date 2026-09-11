@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use cradle_core::catalog::{ArchiveState, Catalog, DestinationRecord, DeviceRecord, RunKind, RunStatus};
 use cradle_core::power::SleepGuard;
-use cradle_core::{archive, backup, device, keychain, precheck, verify};
+use cradle_core::{archive, backup, device, keychain, precheck, restore, verify};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
@@ -42,6 +42,25 @@ fn resolve_working_dir(working_dir: Option<String>) -> PathBuf {
     match working_dir.map(|d| d.trim().to_string()) {
         Some(dir) if !dir.is_empty() => expand_tilde(&dir),
         _ => default_working_dir(),
+    }
+}
+
+/// `~/Cradle/scratch` — where a restore is staged before the protocol
+/// touches the target device. Per CLAUDE.md's architecture rule, this is
+/// never `working/<UDID>/` itself: restore only ever reads the working
+/// set, via [`restore::stage_from_working`]'s copy, and runs against this
+/// separate scratch copy.
+fn default_scratch_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Cradle")
+        .join("scratch")
+}
+
+fn resolve_scratch_dir(scratch_dir: Option<String>) -> PathBuf {
+    match scratch_dir.map(|d| d.trim().to_string()) {
+        Some(dir) if !dir.is_empty() => expand_tilde(&dir),
+        _ => default_scratch_dir(),
     }
 }
 
@@ -192,10 +211,14 @@ pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String
 
     let progress = Arc::new(TauriProgress::for_backup(app.clone()));
     let retry_app = app.clone();
-    let attempt = backup::run_resilient(&*provider, &working_root, false, progress, move |attempt, max| {
+    let attempt = backup::run_resilient(&*provider, &working_root, false, progress, move |reason, attempt, max| {
+        let reason_str = match reason {
+            backup::RetryReason::DeviceLocked => "device_locked",
+            backup::RetryReason::HostIo => "host_io",
+        };
         let _ = retry_app.emit(
             "backup-retry",
-            serde_json::json!({ "attempt": attempt, "max": max }),
+            serde_json::json!({ "reason": reason_str, "attempt": attempt, "max": max }),
         );
     })
     .await;
@@ -475,6 +498,137 @@ pub async fn run_archive(
         }
         Err(e) => {
             let _ = catalog.finish_archive(archive_id, ArchiveState::Failed, None, Some(&e.to_string()));
+            Err(e.to_string())
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct RestoreSourceEntry {
+    udid: String,
+    name: String,
+    product_type: String,
+    ios_version: String,
+    /// Whether `working_dir/<udid>` actually exists on this Mac right now
+    /// — a device can be in the catalog (it's been backed up before)
+    /// without its backup still being present locally (moved, archived
+    /// and cleaned up, etc.), so this is what the UI should gate "can
+    /// restore from this" on, not just catalog membership.
+    has_local_backup: bool,
+}
+
+/// Lists every device Cradle knows about, annotated with whether a local
+/// backup for it is actually available to restore from — feeds the
+/// desktop app's source-device picker for cross-device restore (mirrors
+/// `cradle restore --source-udid`).
+#[tauri::command]
+pub async fn list_restore_sources(working_dir: Option<String>) -> Result<Vec<RestoreSourceEntry>, String> {
+    let working_root = resolve_working_dir(working_dir);
+    let catalog = open_catalog()?;
+    let devices = catalog.list_devices().map_err(|e| e.to_string())?;
+    Ok(devices
+        .into_iter()
+        .map(|d| {
+            let has_local_backup = working_root.join(&d.udid).is_dir();
+            RestoreSourceEntry {
+                udid: d.udid,
+                name: d.name,
+                product_type: d.product_type,
+                ios_version: d.ios_version,
+                has_local_backup,
+            }
+        })
+        .collect())
+}
+
+#[derive(Serialize, Clone)]
+pub struct RestoreSummary {
+    target_udid: String,
+    source_udid: String,
+    rebooted: bool,
+}
+
+/// Restores a backup onto `udid` — the *target* device, which must be
+/// attached. `source_udid` is the UDID the backup was originally taken
+/// from; pass the same value as `udid` to restore a device's own backup
+/// onto itself, or a different one for cross-device migration onto a new
+/// device. Mirrors `cradle restore`'s from-working-directory path.
+///
+/// Free, unconditional, forever — no license check, no network call
+/// (CLAUDE.md non-negotiable #1).
+#[tauri::command]
+pub async fn run_restore(
+    app: AppHandle,
+    udid: String,
+    source_udid: String,
+    working_dir: Option<String>,
+    scratch_dir: Option<String>,
+    reboot: bool,
+    system_files: bool,
+) -> Result<RestoreSummary, String> {
+    // See run_backup's own comment.
+    let _sleep_guard = SleepGuard::engage();
+
+    let working_root = resolve_working_dir(working_dir);
+    let scratch_root = resolve_scratch_dir(scratch_dir);
+    let catalog = open_catalog()?;
+    let provider = device::provider_for(&udid).await.map_err(|e| e.to_string())?;
+
+    let _ = app.emit("restore-status", "Staging backup for restore...");
+    let staged_dir = restore::stage_from_working(&working_root, &source_udid, &scratch_root)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let backup_ios = restore::backup_ios_version(&staged_dir).map_err(|e| e.to_string())?;
+
+    let _ = app.emit("restore-status", "Running restore prechecks...");
+    let report = precheck::run_restore(&*provider, &backup_ios)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !report.pairing_valid {
+        return Err(report
+            .pairing_message
+            .unwrap_or_else(|| "Pairing check failed.".to_string()));
+    }
+    if !report.find_my_disabled {
+        return Err(
+            "Find My is enabled on the target device. Disable it under Settings > [name] > \
+             Find My > Find My iPhone before restoring."
+                .to_string(),
+        );
+    }
+    if !report.target_ios_ok {
+        return Err(format!(
+            "Target device is on iOS {}, but this backup is from iOS {} — restoring backward \
+             isn't supported. Update the target device first.",
+            report.target_ios_version.as_deref().unwrap_or("unknown"),
+            report.backup_ios_version,
+        ));
+    }
+
+    let run_id = catalog
+        .start_run(&udid, RunKind::Restore)
+        .map_err(|e| e.to_string())?;
+
+    let config = restore::RestoreConfig { reboot, system_files };
+    let progress = Arc::new(TauriProgress::for_restore(app.clone()));
+    let _ = app.emit("restore-status", "Restoring...");
+    let result = restore::run(&*provider, &staged_dir, &source_udid, &config, progress).await;
+
+    match result {
+        Ok(outcome) => {
+            catalog
+                .finish_run(run_id, RunStatus::Succeeded, 0, 0, None)
+                .map_err(|e| e.to_string())?;
+            Ok(RestoreSummary {
+                target_udid: outcome.target_udid,
+                source_udid,
+                rebooted: config.reboot,
+            })
+        }
+        Err(e) => {
+            let _ = catalog.finish_run(run_id, RunStatus::Failed, 0, 0, Some(&e.to_string()));
             Err(e.to_string())
         }
     }

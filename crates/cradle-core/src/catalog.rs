@@ -259,6 +259,30 @@ impl Catalog {
         Ok(())
     }
 
+    /// Every device Cradle has ever backed up, most recently seen first.
+    /// Used to offer a cross-device restore source that isn't the device
+    /// currently attached — the whole point of `source_udid` in
+    /// [`crate::restore::run`] is that the backup being restored can come
+    /// from a device that's no longer around.
+    pub fn list_devices(&self) -> Result<Vec<DeviceRecord>, CradleError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT udid, name, product_type, ios_version, encrypted
+             FROM devices ORDER BY last_seen DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DeviceRecord {
+                    udid: row.get(0)?,
+                    name: row.get(1)?,
+                    product_type: row.get(2)?,
+                    ios_version: row.get(3)?,
+                    encrypted: row.get::<_, i64>(4)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Opens a new run row with `status = 'running'` and returns its id.
     pub fn start_run(&self, udid: &str, kind: RunKind) -> Result<i64, CradleError> {
         self.conn.execute(
@@ -663,6 +687,18 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn list_devices_returns_every_device_seen() {
+        let cat = open_temp();
+        cat.upsert_device(&device("udid-1")).unwrap();
+        cat.upsert_device(&device("udid-2")).unwrap();
+
+        let udids: Vec<String> = cat.list_devices().unwrap().into_iter().map(|d| d.udid).collect();
+        assert_eq!(udids.len(), 2);
+        assert!(udids.contains(&"udid-1".to_string()));
+        assert!(udids.contains(&"udid-2".to_string()));
     }
 
     #[test]

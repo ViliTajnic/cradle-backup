@@ -445,13 +445,20 @@ async fn run_backup(
             &working_root,
             full,
             progress.clone(),
-            |attempt, max_attempts| {
-                eprintln!(
+            |reason, attempt, max_attempts| match reason {
+                backup::RetryReason::DeviceLocked => eprintln!(
                     "\nDevice locked mid-backup — unlock it now. Retrying in {}s (attempt {}/{})...",
                     backup::LOCK_RETRY_DELAY.as_secs(),
                     attempt,
                     max_attempts
-                );
+                ),
+                backup::RetryReason::HostIo => eprintln!(
+                    "\nHost-side I/O error (device error 104) — usually low memory on this Mac. \
+                     Retrying in {}s (attempt {}/{})...",
+                    backup::HOST_IO_RETRY_DELAY.as_secs(),
+                    attempt,
+                    max_attempts
+                ),
             },
         )
         .await?;
