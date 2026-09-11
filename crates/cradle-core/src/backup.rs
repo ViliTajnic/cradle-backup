@@ -85,6 +85,47 @@ pub struct Outcome {
     pub bytes_transferred: u64,
 }
 
+/// A backup failure paired with how far the run got before it happened.
+///
+/// Found via a real run: a device error late in a 53-minute transfer left
+/// the catalog recording 0 bytes / 0 files for a run that had in fact been
+/// moving data continuously — [`run`]'s delegate was tracking real counts
+/// the whole time, they just never survived the `Err` path out of the
+/// function. `bytes_transferred`/`files_received` are 0 only when the run
+/// never got far enough to create the delegate (a connection failure, a
+/// missing UDID) — genuinely nothing moved in that case.
+#[derive(Debug)]
+pub struct BackupError {
+    pub source: CradleError,
+    pub bytes_transferred: u64,
+    pub files_received: u64,
+}
+
+impl std::fmt::Display for BackupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for BackupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Early failures (connect, missing UDID, `create_dir_all`) happen before
+/// [`CradleDelegate`] exists to have counted anything — 0/0 here is
+/// accurate, not a loss of information.
+impl From<CradleError> for BackupError {
+    fn from(source: CradleError) -> Self {
+        Self {
+            source,
+            bytes_transferred: 0,
+            files_received: 0,
+        }
+    }
+}
+
 /// [`BackupDelegate`] that stores to the local filesystem — via the crate's
 /// own [`FsBackupDelegate`] — while forwarding progress to a
 /// [`ProgressSink`].
@@ -372,15 +413,19 @@ pub async fn run(
     working_root: &Path,
     force_full: bool,
     progress: Arc<dyn ProgressSink>,
-) -> Result<Outcome, CradleError> {
-    let mut client = MobileBackup2Client::connect(provider).await?;
+) -> Result<Outcome, BackupError> {
+    let mut client = MobileBackup2Client::connect(provider)
+        .await
+        .map_err(CradleError::from)?;
     let udid = client
         .idevice
         .udid()
         .map(|s| s.to_string())
         .ok_or(CradleError::MissingUdid)?;
 
-    tokio::fs::create_dir_all(working_root).await?;
+    tokio::fs::create_dir_all(working_root)
+        .await
+        .map_err(CradleError::from)?;
 
     let options = force_full.then(|| {
         let mut dict = plist::Dictionary::new();
@@ -400,6 +445,17 @@ pub async fn run(
     // backed up, just without the live "look at your phone" signal.
     let notification_proxy = NotificationProxyClient::connect(provider).await.ok();
 
+    // Reads `delegate`'s counters as they stand right now — used on every
+    // error path below, since `delegate` is only borrowed by
+    // `backup_from_path`, not consumed, so it's still ours to read no
+    // matter how the transfer ended.
+    let partial_counts = |delegate: &CradleDelegate| {
+        (
+            delegate.bytes_transferred.load(Ordering::Relaxed),
+            delegate.files_received.load(Ordering::Relaxed),
+        )
+    };
+
     let backup = client.backup_from_path(working_root, None, options, &delegate);
     let response = match notification_proxy {
         Some(np_client) => {
@@ -411,25 +467,41 @@ pub async fn run(
             }
         }
         None => backup.await,
-    }?;
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            let (bytes_transferred, files_received) = partial_counts(&delegate);
+            return Err(BackupError {
+                source: CradleError::from(e),
+                bytes_transferred,
+                files_received,
+            });
+        }
+    };
 
     if let Some(dict) = &response
         && let Some(code) = dict.get("ErrorCode")
     {
+        let (bytes_transferred, files_received) = partial_counts(&delegate);
         let number = code.as_signed_integer();
-        if number == Some(208) {
-            return Err(CradleError::DeviceLocked);
-        }
-        if number == Some(104) {
-            return Err(CradleError::HostIoError);
-        }
-        let hint = number.and_then(device_error_hint);
-        let message = match (number, hint) {
-            (Some(n), Some(hint)) => format!("device backup error {n}: {hint}"),
-            (Some(n), None) => format!("device reported backup error {n}"),
-            (None, _) => format!("device reported a backup error: {code:?}"),
+        let source = if number == Some(208) {
+            CradleError::DeviceLocked
+        } else if number == Some(104) {
+            CradleError::HostIoError
+        } else {
+            let hint = number.and_then(device_error_hint);
+            CradleError::Other(match (number, hint) {
+                (Some(n), Some(hint)) => format!("device backup error {n}: {hint}"),
+                (Some(n), None) => format!("device reported backup error {n}"),
+                (None, _) => format!("device reported a backup error: {code:?}"),
+            })
         };
-        return Err(CradleError::Other(message));
+        return Err(BackupError {
+            source,
+            bytes_transferred,
+            files_received,
+        });
     }
 
     Ok(Outcome {
@@ -487,29 +559,34 @@ pub enum RetryReason {
 /// `Status.plist`/`Manifest.plist`/`Manifest.db` there on the next attempt
 /// and computes an incremental rather than starting the whole backup over
 /// (see this module's own doc comment on why that's true).
+/// Errors out with a [`BackupError`] carrying the *last attempt's* partial
+/// counts, not an accumulation across retries — retries don't touch
+/// `working_root`, so whatever a prior attempt already wrote stays on disk
+/// and doesn't need to be counted again; only what the final attempt itself
+/// moved matters for the catalog.
 pub async fn run_resilient(
     provider: &dyn IdeviceProvider,
     working_root: &Path,
     force_full: bool,
     progress: Arc<dyn ProgressSink>,
     on_retry: impl Fn(RetryReason, u32, u32),
-) -> Result<Outcome, CradleError> {
+) -> Result<Outcome, BackupError> {
     let mut lock_attempt = 1;
     let mut host_io_attempt = 1;
     loop {
         match run(provider, working_root, force_full, progress.clone()).await {
             Ok(outcome) => return Ok(outcome),
-            Err(CradleError::DeviceLocked) if lock_attempt < LOCK_RETRY_ATTEMPTS => {
+            Err(err) if matches!(err.source, CradleError::DeviceLocked) && lock_attempt < LOCK_RETRY_ATTEMPTS => {
                 on_retry(RetryReason::DeviceLocked, lock_attempt, LOCK_RETRY_ATTEMPTS);
                 tokio::time::sleep(LOCK_RETRY_DELAY).await;
                 lock_attempt += 1;
             }
-            Err(CradleError::HostIoError) if host_io_attempt < HOST_IO_RETRY_ATTEMPTS => {
+            Err(err) if matches!(err.source, CradleError::HostIoError) && host_io_attempt < HOST_IO_RETRY_ATTEMPTS => {
                 on_retry(RetryReason::HostIo, host_io_attempt, HOST_IO_RETRY_ATTEMPTS);
                 tokio::time::sleep(HOST_IO_RETRY_DELAY).await;
                 host_io_attempt += 1;
             }
-            Err(e) => return Err(e),
+            Err(err) => return Err(err),
         }
     }
 }

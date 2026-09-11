@@ -439,7 +439,14 @@ async fn run_backup(
     println!("Prechecks passed. Backing up into {}...", working_root.display());
 
     let progress = Arc::new(TerminalProgress::new());
-    let attempt: Result<(backup::Outcome, verify::Report), CradleError> = async {
+    // Error carries (error, bytes_transferred, files_received) so far —
+    // once `outcome` exists it has the real counts `backup::run` measured;
+    // before that, `BackupError`'s own counts (0/0, since nothing moved
+    // yet) cover it. Without this, a run that failed verification or
+    // keychain lookup *after* a real transfer would still land in the
+    // catalog as 0 bytes / 0 files, same bug this whole thing exists to
+    // avoid.
+    let attempt: Result<(backup::Outcome, verify::Report), (CradleError, u64, u64)> = async {
         let outcome = backup::run_resilient(
             &*provider,
             &working_root,
@@ -461,7 +468,8 @@ async fn run_backup(
                 ),
             },
         )
-        .await?;
+        .await
+        .map_err(|e| (e.source, e.bytes_transferred, e.files_received))?;
         progress.finish();
 
         println!("Verifying backup...");
@@ -469,13 +477,15 @@ async fn run_backup(
         // check instead of the reduced one — see verify.rs's module doc.
         // Not finding one is the common case, not an error: nothing here
         // prompts for it mid-backup.
-        let stored_password = keychain::try_read(&keychain::device_account(&udid))?;
+        let stored_password = keychain::try_read(&keychain::device_account(&udid))
+            .map_err(|e| (e, outcome.bytes_transferred, outcome.files_received))?;
         let gate = verify::run(
             &outcome.backup_dir,
             outcome.files_received,
             stored_password.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(|e| (e, outcome.bytes_transferred, outcome.files_received))?;
         Ok((outcome, gate))
     }
     .await;
@@ -524,10 +534,16 @@ async fn run_backup(
                 problems.join("\n"),
             );
         }
-        Err(e) => {
+        Err((e, bytes_transferred, files_received)) => {
             // Record the failure before propagating it — a run left
             // "running" forever in the catalog would be its own bug.
-            catalog.finish_run(run_id, RunStatus::Failed, 0, 0, Some(&e.to_string()))?;
+            catalog.finish_run(
+                run_id,
+                RunStatus::Failed,
+                bytes_transferred,
+                files_received,
+                Some(&e.to_string()),
+            )?;
             Err(e.into())
         }
     }

@@ -225,14 +225,35 @@ pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String
 
     let outcome = match attempt {
         Ok(outcome) => outcome,
-        Err(e) => {
-            let _ = catalog.finish_run(run_id, RunStatus::Failed, 0, 0, Some(&e.to_string()));
-            return Err(e.to_string());
+        Err(backup_err) => {
+            let _ = catalog.finish_run(
+                run_id,
+                RunStatus::Failed,
+                backup_err.bytes_transferred,
+                backup_err.files_received,
+                Some(&backup_err.source.to_string()),
+            );
+            return Err(backup_err.source.to_string());
         }
     };
 
     let _ = app.emit("backup-status", "Verifying backup...");
-    let stored_password = keychain::try_read(&keychain::device_account(&udid)).map_err(|e| e.to_string())?;
+    let stored_password = match keychain::try_read(&keychain::device_account(&udid)) {
+        Ok(password) => password,
+        Err(e) => {
+            // Record the failure before propagating it — a run left
+            // "running" forever in the catalog would be its own bug (same
+            // reasoning as cradle-cli's run_backup).
+            let _ = catalog.finish_run(
+                run_id,
+                RunStatus::Failed,
+                outcome.bytes_transferred,
+                outcome.files_received,
+                Some(&e.to_string()),
+            );
+            return Err(e.to_string());
+        }
+    };
     let gate = match verify::run(&outcome.backup_dir, outcome.files_received, stored_password.as_deref()).await {
         Ok(gate) => gate,
         Err(e) => {
@@ -240,7 +261,7 @@ pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String
                 run_id,
                 RunStatus::Failed,
                 outcome.bytes_transferred,
-                0,
+                outcome.files_received,
                 Some(&e.to_string()),
             );
             return Err(e.to_string());
