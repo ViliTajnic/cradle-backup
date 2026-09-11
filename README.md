@@ -6,8 +6,8 @@ real progress instead of an indeterminate spinner.
 
 See [`CLAUDE.md`](./CLAUDE.md) for the project's non-negotiables and
 architecture, and [`ROADMAP.md`](./ROADMAP.md) for the milestone plan. This
-repo is at **M2** — protocol spike + verification gate + catalog, partially
-verified against real hardware.
+repo is at **M3** — protocol spike + verification gate + catalog + archive
+layer, partially verified against real hardware and real infrastructure.
 
 ## Status
 
@@ -27,14 +27,21 @@ layer exists: see the doc comment at the top of
 `crates/cradle-core/src/verify.rs` for what's checked now versus what
 `CLAUDE.md` specifies.
 
+M3's archive layer is integration-tested against a real `restic` binary and
+the real macOS Keychain (not just unit tests) — see `ROADMAP.md`'s M3
+section for two real bugs that testing caught, including one that would
+have hung real users' terminals indefinitely on a macOS Keychain dialog.
+
 ## Layout
 
 - `crates/cradle-core` — device discovery, prechecks, the `mobilebackup2`
-  backup path, the post-backup verification gate, and the catalog
-  (`devices`/`runs`/`snapshots` in SQLite). No UI, no archiving, no restore
-  (those are later milestones).
+  backup path, the post-backup verification gate, the catalog
+  (`devices`/`runs`/`snapshots`/`destinations`/`archives` in SQLite), the
+  restic-backed archive layer, and Keychain access for repository
+  passwords. No UI, no restore yet (later milestones).
 - `crates/cradle-cli` — the `cradle` binary: `cradle devices`,
-  `cradle backup`, `cradle history`.
+  `cradle backup`, `cradle history`, `cradle destination add/list`,
+  `cradle archive run/list/prune/check`.
 
 ## Building
 
@@ -46,7 +53,8 @@ need a newer stable than 1.85 alone.
 cargo build
 ```
 
-On macOS, `usbmuxd` is part of the OS — nothing else to install.
+On macOS, `usbmuxd` is part of the OS — nothing else to install. The
+archive layer needs `restic` on `PATH` (`brew install restic`).
 
 ## Usage
 
@@ -54,6 +62,12 @@ On macOS, `usbmuxd` is part of the OS — nothing else to install.
 cradle devices                              # list attached devices
 cradle backup --udid <UDID>                 # back up into ./working/<UDID>/
 cradle history --udid <UDID>                # show recorded runs/snapshots
+
+cradle destination add --name nas --uri /Volumes/backups/cradle-repo
+cradle archive run --udid <UDID> --destination nas
+cradle archive list --destination nas       # snapshots actually in the repo
+cradle archive prune --destination nas --keep-last 10
+cradle archive check --destination nas      # full repo integrity check
 ```
 
 `working/` is the canonical working directory (see `CLAUDE.md`): it is
@@ -62,9 +76,16 @@ twice against the same device — the second run should be dramatically
 faster, since MobileBackup2 computes incrementals on the device by
 inspecting what's already sitting in `working/<UDID>/`.
 
+`--uri` for `destination add` is any restic-compatible repository location
+— a local path, `sftp:user@host:/path`, `s3:s3.amazonaws.com/bucket`,
+`b2:bucket:path`. `archive run` only works on a snapshot that passed the
+M1 verification gate.
+
 The catalog lives at the platform data directory by default (e.g.
 `~/Library/Application Support/Cradle/catalog.db` on macOS) — override with
-`--catalog <path>` on any command.
+`--catalog <path>` on any command. Each destination's restic repository
+password is generated automatically and stored in the macOS Keychain,
+never in the catalog or anywhere on disk in the clear.
 
 ## License
 

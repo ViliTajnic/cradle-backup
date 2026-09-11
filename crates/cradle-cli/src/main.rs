@@ -1,17 +1,18 @@
-//! Cradle CLI — M0 connect/precheck/backup, M1 verification gate, M2 catalog.
+//! Cradle CLI — M0 connect/precheck/backup, M1 verification gate, M2
+//! catalog, M3 archive layer.
 //!
 //! Per CLAUDE.md, the CLI is not a debug tool: it ships, it is supported,
 //! and it is the free tier's complete interface.
 
 mod progress;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use cradle_core::CradleError;
-use cradle_core::catalog::{Catalog, DeviceRecord, RunKind, RunStatus};
-use cradle_core::{backup, device, precheck, verify};
+use cradle_core::catalog::{ArchiveState, Catalog, DestinationRecord, DeviceRecord, RunKind, RunStatus};
+use cradle_core::{archive, backup, device, keychain, precheck, verify};
 
 use progress::{TerminalProgress, human_bytes};
 
@@ -52,6 +53,85 @@ enum Command {
         #[arg(long)]
         udid: String,
     },
+    /// Manage archive destinations (restic repositories).
+    Destination {
+        #[command(subcommand)]
+        command: DestinationCommand,
+    },
+    /// Archive a verified snapshot out of the working directory (see
+    /// CLAUDE.md: "Archiving copies out of it").
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DestinationCommand {
+    /// Register a new archive destination and initialize its repository.
+    ///
+    /// `--uri` is any restic-compatible repository location: a local
+    /// path, `sftp:user@host:/path`, `s3:s3.amazonaws.com/bucket`,
+    /// `b2:bucket:path`, etc. — restic's own backend abstraction
+    /// interprets it, Cradle doesn't parse it.
+    Add {
+        /// Short name to refer to this destination by in other commands.
+        #[arg(long)]
+        name: String,
+        /// Informational only (e.g. "local", "nas", "s3", "b2") — every
+        /// kind is wrapped identically; see the `archive` module.
+        #[arg(long, default_value = "local")]
+        kind: String,
+        #[arg(long)]
+        uri: String,
+    },
+    /// List configured destinations.
+    List,
+}
+
+#[derive(Subcommand)]
+enum ArchiveCommand {
+    /// Archives the latest verified snapshot for a device to a destination.
+    Run {
+        #[arg(long)]
+        udid: String,
+        #[arg(long)]
+        destination: String,
+        /// Must match the `--working-dir` the snapshot was backed up
+        /// into — the catalog doesn't store a path, only that one
+        /// canonical `<root>/<UDID>/` convention (see CLAUDE.md).
+        #[arg(long, default_value = "working")]
+        working_dir: PathBuf,
+    },
+    /// Lists snapshots actually stored at a destination's repository
+    /// (restic's own view, not the local catalog's `archives` table).
+    List {
+        #[arg(long)]
+        destination: String,
+    },
+    /// Applies a retention policy, deleting data no longer kept.
+    ///
+    /// At least one `--keep-*` flag is required — restic (and Cradle)
+    /// refuse to guess at "keep nothing" by omission.
+    Prune {
+        #[arg(long)]
+        destination: String,
+        #[arg(long)]
+        keep_last: Option<u32>,
+        #[arg(long)]
+        keep_daily: Option<u32>,
+        #[arg(long)]
+        keep_weekly: Option<u32>,
+        #[arg(long)]
+        keep_monthly: Option<u32>,
+    },
+    /// Runs a full repository integrity check. Heavier than the
+    /// integrity restic already confirms during every `archive run` —
+    /// see `archive::check`'s doc comment.
+    Check {
+        #[arg(long)]
+        destination: String,
+    },
 }
 
 #[tokio::main]
@@ -74,6 +154,8 @@ async fn main() -> anyhow::Result<()> {
             full,
         } => run_backup(udid, working_dir, full, catalog_path).await,
         Command::History { udid } => run_history(udid, catalog_path),
+        Command::Destination { command } => run_destination(command, catalog_path).await,
+        Command::Archive { command } => run_archive(command, catalog_path).await,
     }
 }
 
@@ -336,4 +418,206 @@ fn format_timestamp(unix_secs: i64) -> String {
         .ok()
         .and_then(|t| t.format(&Rfc3339).ok())
         .unwrap_or_else(|| unix_secs.to_string())
+}
+
+async fn run_destination(command: DestinationCommand, catalog_path: PathBuf) -> anyhow::Result<()> {
+    let catalog = Catalog::open(&catalog_path)?;
+    match command {
+        DestinationCommand::Add { name, kind, uri } => {
+            if catalog.destination_by_name(&name)?.is_some() {
+                anyhow::bail!("A destination named '{name}' already exists.");
+            }
+
+            let credential_ref = keychain::destination_account(&name);
+            keychain::generate_and_store(&credential_ref)?;
+
+            // A throwaway record (id doesn't matter — archive:: only reads
+            // uri/credential_ref) so init can run *before* the catalog
+            // insert: if it fails, nothing gets recorded at all, rather
+            // than needing to roll back a row that pointed at a repo we
+            // never actually opened.
+            let probe = DestinationRecord {
+                id: 0,
+                name: name.clone(),
+                kind: kind.clone(),
+                uri: uri.clone(),
+                credential_ref: credential_ref.clone(),
+                retention_json: None,
+            };
+
+            println!("Initializing repository at {uri}...");
+            let created = match archive::ensure_initialized(&probe).await {
+                Ok(created) => created,
+                Err(e) => {
+                    let _ = keychain::delete(&credential_ref);
+                    return Err(e.into());
+                }
+            };
+
+            catalog.create_destination(&name, &kind, &uri, &credential_ref)?;
+
+            if created {
+                println!("Destination '{name}' created and repository initialized.");
+            } else {
+                println!(
+                    "Destination '{name}' created — a repository already existed at {uri}, reusing it."
+                );
+            }
+            Ok(())
+        }
+        DestinationCommand::List => {
+            let destinations = catalog.list_destinations()?;
+            if destinations.is_empty() {
+                println!("No destinations configured. Add one with `cradle destination add`.");
+                return Ok(());
+            }
+            for d in destinations {
+                println!("{:<12} {:<8} {}", d.name, d.kind, d.uri);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn resolve_destination(catalog: &Catalog, name: &str) -> anyhow::Result<DestinationRecord> {
+    catalog.destination_by_name(name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No destination named '{name}'. Run `cradle destination list` to see what's configured."
+        )
+    })
+}
+
+async fn run_archive(command: ArchiveCommand, catalog_path: PathBuf) -> anyhow::Result<()> {
+    let catalog = Catalog::open(&catalog_path)?;
+    match command {
+        ArchiveCommand::Run {
+            udid,
+            destination,
+            working_dir,
+        } => run_archive_run(&catalog, &udid, &destination, &working_dir).await,
+        ArchiveCommand::List { destination } => run_archive_list(&catalog, &destination).await,
+        ArchiveCommand::Prune {
+            destination,
+            keep_last,
+            keep_daily,
+            keep_weekly,
+            keep_monthly,
+        } => {
+            let policy = archive::RetentionPolicy {
+                keep_last,
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+            };
+            run_archive_prune(&catalog, &destination, policy).await
+        }
+        ArchiveCommand::Check { destination } => run_archive_check(&catalog, &destination).await,
+    }
+}
+
+async fn run_archive_run(
+    catalog: &Catalog,
+    udid: &str,
+    destination_name: &str,
+    working_root: &Path,
+) -> anyhow::Result<()> {
+    let destination = resolve_destination(catalog, destination_name)?;
+
+    let snapshot = catalog.latest_verified_snapshot(udid)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No verified snapshot for {udid} yet — run `cradle backup --udid {udid}` first. Per \
+             CLAUDE.md, an unverified backup is never treated as an archivable snapshot."
+        )
+    })?;
+
+    let source_dir = working_root.join(udid);
+    if !source_dir.is_dir() {
+        anyhow::bail!(
+            "Catalog has a verified snapshot for {udid}, but {} doesn't exist. Did --working-dir \
+             change since that backup ran?",
+            source_dir.display()
+        );
+    }
+
+    archive::ensure_initialized(&destination).await?;
+    let archive_id = catalog.start_archive(snapshot.id, destination.id)?;
+
+    println!(
+        "Archiving {} to '{}' ({})...",
+        source_dir.display(),
+        destination.name,
+        destination.uri
+    );
+    let progress = Arc::new(TerminalProgress::new());
+    let result = archive::backup(&destination, &source_dir, progress.clone()).await;
+    progress.finish();
+
+    match result {
+        Ok(summary) => {
+            catalog.finish_archive(
+                archive_id,
+                ArchiveState::Succeeded,
+                Some(&summary.snapshot_id),
+                None,
+            )?;
+            println!(
+                "Archived: restic snapshot {} — {} new data written ({} processed, {} files).",
+                summary.snapshot_id,
+                human_bytes(summary.data_added),
+                human_bytes(summary.total_bytes_processed),
+                summary.total_files_processed,
+            );
+            Ok(())
+        }
+        Err(e) => {
+            catalog.finish_archive(archive_id, ArchiveState::Failed, None, Some(&e.to_string()))?;
+            Err(e.into())
+        }
+    }
+}
+
+async fn run_archive_list(catalog: &Catalog, destination_name: &str) -> anyhow::Result<()> {
+    let destination = resolve_destination(catalog, destination_name)?;
+    let snapshots = archive::list_snapshots(&destination).await?;
+    if snapshots.is_empty() {
+        println!("No snapshots in '{destination_name}' yet.");
+        return Ok(());
+    }
+    for s in snapshots {
+        println!("{}  {}  {}", s.short_id, s.time, s.paths.join(", "));
+    }
+    Ok(())
+}
+
+async fn run_archive_prune(
+    catalog: &Catalog,
+    destination_name: &str,
+    policy: archive::RetentionPolicy,
+) -> anyhow::Result<()> {
+    let destination = resolve_destination(catalog, destination_name)?;
+    println!("Applying retention policy to '{destination_name}'...");
+    let summary = archive::forget_and_prune(&destination, &policy).await?;
+    catalog.set_destination_retention(destination.id, &policy.to_json())?;
+    println!(
+        "Kept {} snapshot(s), removed {}.",
+        summary.kept, summary.removed
+    );
+    Ok(())
+}
+
+async fn run_archive_check(catalog: &Catalog, destination_name: &str) -> anyhow::Result<()> {
+    let destination = resolve_destination(catalog, destination_name)?;
+    println!(
+        "Checking repository integrity for '{destination_name}' (reads the whole repo, may take a while)..."
+    );
+    let summary = archive::check(&destination).await?;
+    if summary.num_errors == 0 {
+        println!("No errors found.");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "restic check found {} error(s) in '{destination_name}'.",
+            summary.num_errors
+        );
+    }
 }

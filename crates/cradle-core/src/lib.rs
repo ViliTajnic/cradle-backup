@@ -1,15 +1,17 @@
-//! Device protocol, prechecks, backup orchestration and the catalog for
-//! Cradle.
+//! Device protocol, prechecks, backup orchestration, the catalog, and the
+//! archive layer for Cradle.
 //!
-//! M0-M2 scope only (see `/ROADMAP.md`): connect to a device over
+//! M0-M3 scope only (see `/ROADMAP.md`): connect to a device over
 //! `mobilebackup2`, run prechecks, perform a backup into the canonical
-//! working directory with honest progress reporting, verify it, and record
-//! it in a small local catalog. No archiving, no restore yet — those land
-//! in later milestones and must not be built ahead of schedule.
+//! working directory with honest progress reporting, verify it, record it
+//! in a small local catalog, and archive it out to a restic-backed
+//! destination. No restore yet — that's M4.
 
+pub mod archive;
 pub mod backup;
 pub mod catalog;
 pub mod device;
+pub mod keychain;
 pub mod precheck;
 pub mod verify;
 

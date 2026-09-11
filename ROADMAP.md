@@ -78,12 +78,59 @@ if the verification gate passed, a snapshot row. `cradle history --udid
 needs a real end-to-end run to confirm, which is still blocked on the
 same thing M0 is: letting one full backup actually finish.
 
-## M3 — Archive layer
+## M3 — Archive layer ✅ built and verified against real `restic`
 
 restic subprocess wrapper. Local first, then NAS mount, then S3/B2.
 Snapshot listing and retention (`forget --prune`).
 
 Working set stays canonical. Archives copy out of it.
+
+One wrapper handles all three phases without separate code paths: every
+restic-compatible repository URI (local path, `sftp:`, `s3:`, `b2:`, ...)
+works unchanged, because restic's own backend abstraction is what actually
+interprets it — "local first, then NAS, then S3/B2" is a validation order,
+not an implementation order. Only local disk has actually been exercised
+so far, per that same ordering.
+
+`archive.rs` wraps `restic init`/`backup`/`snapshots`/`forget --prune`/
+`check` as JSON-streaming subprocesses, reusing `backup::ProgressSink` for
+archive progress too — same interface, same "no spinner" rule, verified
+with a real ~80 MB two-file transfer to see actual `status` messages, not
+just guessed at the schema. `keychain.rs` generates a repository password
+per destination via `security-framework` (native `Security.framework`
+bindings, not the `security` CLI — see that module's doc for why).
+`catalog.rs` gained `destinations` and `archives`, completing the schema
+from CLAUDE.md.
+
+Two real, verified-against-real-hardware bugs worth flagging for anyone
+touching this again:
+- Originally handed restic the repository password via `--password-command
+  "security find-generic-password ..."`, reasoning that restic's *own*
+  child process reading the secret would never expose it in Cradle's env.
+  This hung indefinitely against a real repository: a Keychain item
+  created via `SecItemAdd` gets an ACL scoped to the creating application,
+  and `/usr/bin/security` — spawned by restic, not Cradle — triggered a
+  macOS authorization *dialog* to read it, with no terminal to answer it.
+  Fixed by reading the password in Cradle's own process (inside the ACL
+  that created it) and passing it via `RESTIC_PASSWORD` on restic's
+  environment instead.
+- `restic forget --json` prints `"remove":null` (not `[]`) when nothing is
+  pruned. A `Vec<T>` field with `#[serde(default)]` only covers a *missing*
+  key, not a present `null` one — needed `Option<Vec<T>>`. Caught by a real
+  `forget --prune` run in the integration test, not a hand-written fixture.
+
+New CLI surface: `cradle destination add/list`, `cradle archive
+run/list/prune/check`. `cradle archive run` requires a verified snapshot
+in the catalog and reconstructs its path as `<working-dir>/<UDID>` — the
+schema has no per-snapshot path column, so this only works if
+`--working-dir` matches what `cradle backup` used, matching the
+architecture's one-canonical-location-per-UDID assumption.
+
+Integration-tested against a real `restic` 0.19.1 binary and the real
+macOS Keychain (`archive::tests`, `keychain::tests` — `#[ignore]`d since
+they need `restic` on PATH; run with `cargo test -- --ignored`), plus a
+full manual CLI smoke test (`destination add` → `archive run` → `list` →
+`check` → `prune`, catalog rows confirmed via `sqlite3`).
 
 ## M4 — Restore
 

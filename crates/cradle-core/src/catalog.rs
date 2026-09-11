@@ -1,14 +1,18 @@
-//! The catalog: devices, runs, snapshots. Nothing else.
+//! The catalog: devices, runs, snapshots, destinations, archives.
 //!
 //! Per CLAUDE.md: "Keep it small. It tracks devices, runs and snapshots —
-//! not file-level deltas." `archives` and `destinations` join this schema
-//! in M3, once there's an archive layer to populate them — adding empty,
-//! unused tables now would be working ahead of what this milestone needs.
+//! not file-level deltas." `destinations` and `archives` joined this
+//! schema in M3, once there was an archive layer to populate them.
 //!
-//! Secrets never live here. `devices.credential_ref` is a name to look up
-//! in the macOS Keychain (Windows DPAPI later), never a secret value
-//! itself — nothing populates it yet, since nothing in Cradle needs a
-//! stored secret before M5's crypto layer.
+//! Secrets never live here. `devices.credential_ref` and
+//! `destinations.credential_ref` are names to look up in the macOS
+//! Keychain (Windows DPAPI later) — see [`crate::keychain`] — never a
+//! secret value itself. `devices.credential_ref` still isn't populated by
+//! anything; nothing needs a per-device stored secret before M5's crypto
+//! layer. `destinations.credential_ref` is populated from M3 on: every
+//! restic repository needs a password, and restic — not Cradle — is the
+//! thing that encrypts archived data (CLAUDE.md: "Do not build: archive
+//! encryption").
 
 use std::path::{Path, PathBuf};
 
@@ -49,8 +53,30 @@ CREATE TABLE IF NOT EXISTS snapshots (
     verified_at  INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS destinations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,
+    kind            TEXT NOT NULL,
+    uri             TEXT NOT NULL,
+    credential_ref  TEXT NOT NULL,
+    retention_json  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS archives (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id),
+    destination_id  INTEGER NOT NULL REFERENCES destinations(id),
+    restic_id       TEXT,
+    state           TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    verified_at     INTEGER,
+    error           TEXT
+);
+
 CREATE INDEX IF NOT EXISTS runs_udid ON runs(udid);
 CREATE INDEX IF NOT EXISTS snapshots_udid ON snapshots(udid);
+CREATE INDEX IF NOT EXISTS archives_snapshot ON archives(snapshot_id);
+CREATE INDEX IF NOT EXISTS archives_destination ON archives(destination_id);
 ";
 
 /// Handle to the catalog database. One per process is plenty — this is
@@ -127,6 +153,56 @@ pub struct SnapshotRecord {
     pub size: i64,
     pub ios_version: String,
     pub verified_at: Option<i64>,
+}
+
+/// A configured archive target, for the `destinations` table. `kind` is
+/// informational (`"local"` / `"nas"` / `"s3"` / `"b2"`, ...) — restic's own
+/// backend abstraction is what actually interprets `uri`; nothing in
+/// Cradle branches on `kind` to talk to a backend differently. See
+/// `archive.rs`.
+#[derive(Debug, Clone)]
+pub struct DestinationRecord {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub uri: String,
+    /// Keychain account — see [`crate::keychain::destination_account`].
+    /// Never the password itself.
+    pub credential_ref: String,
+    pub retention_json: Option<String>,
+}
+
+/// Whether an archive attempt is in flight or how it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveState {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+impl ArchiveState {
+    fn as_str(self) -> &'static str {
+        match self {
+            ArchiveState::Pending => "pending",
+            ArchiveState::Succeeded => "succeeded",
+            ArchiveState::Failed => "failed",
+        }
+    }
+}
+
+/// One row from `archives`. Tied to a local `snapshot_id`, not a `run_id`
+/// — archiving is its own operation against an already-verified snapshot,
+/// not a kind of run.
+#[derive(Debug, Clone)]
+pub struct ArchiveRecord {
+    pub id: i64,
+    pub snapshot_id: i64,
+    pub destination_id: i64,
+    pub restic_id: Option<String>,
+    pub state: String,
+    pub created_at: i64,
+    pub verified_at: Option<i64>,
+    pub error: Option<String>,
 }
 
 /// Current time as Unix seconds — every timestamp column in this schema
@@ -307,6 +383,176 @@ impl Catalog {
             )
             .optional()
             .map_err(CradleError::from)
+    }
+
+    /// The most recently taken *verified* snapshot for `udid`, if any.
+    /// What `cradle archive` looks for — per CLAUDE.md, a partial backup
+    /// must never become a snapshot, so archiving must never pick up one
+    /// that hasn't passed the verification gate.
+    pub fn latest_verified_snapshot(
+        &self,
+        udid: &str,
+    ) -> Result<Option<SnapshotRecord>, CradleError> {
+        self.conn
+            .query_row(
+                "SELECT id, udid, run_id, taken_at, size, ios_version, verified_at
+                 FROM snapshots
+                 WHERE udid = ?1 AND verified_at IS NOT NULL
+                 ORDER BY taken_at DESC LIMIT 1",
+                params![udid],
+                |row| {
+                    Ok(SnapshotRecord {
+                        id: row.get(0)?,
+                        udid: row.get(1)?,
+                        run_id: row.get(2)?,
+                        taken_at: row.get(3)?,
+                        size: row.get(4)?,
+                        ios_version: row.get(5)?,
+                        verified_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(CradleError::from)
+    }
+
+    /// Registers a new archive destination. `credential_ref` is a Keychain
+    /// account name (see [`crate::keychain::destination_account`]), not a
+    /// secret.
+    pub fn create_destination(
+        &self,
+        name: &str,
+        kind: &str,
+        uri: &str,
+        credential_ref: &str,
+    ) -> Result<i64, CradleError> {
+        self.conn.execute(
+            "INSERT INTO destinations (name, kind, uri, credential_ref) VALUES (?1, ?2, ?3, ?4)",
+            params![name, kind, uri, credential_ref],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Looks up a destination by its unique name (what the CLI addresses
+    /// destinations by — ids are catalog-internal).
+    pub fn destination_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<DestinationRecord>, CradleError> {
+        self.conn
+            .query_row(
+                "SELECT id, name, kind, uri, credential_ref, retention_json
+                 FROM destinations WHERE name = ?1",
+                params![name],
+                Self::map_destination,
+            )
+            .optional()
+            .map_err(CradleError::from)
+    }
+
+    /// All configured destinations.
+    pub fn list_destinations(&self) -> Result<Vec<DestinationRecord>, CradleError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, kind, uri, credential_ref, retention_json FROM destinations ORDER BY name")?;
+        let rows = stmt
+            .query_map([], Self::map_destination)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Records the retention policy most recently used to prune a
+    /// destination, for audit — this does not itself apply retention; see
+    /// `archive::prune`.
+    pub fn set_destination_retention(
+        &self,
+        destination_id: i64,
+        retention_json: &str,
+    ) -> Result<(), CradleError> {
+        self.conn.execute(
+            "UPDATE destinations SET retention_json = ?1 WHERE id = ?2",
+            params![retention_json, destination_id],
+        )?;
+        Ok(())
+    }
+
+    fn map_destination(row: &rusqlite::Row) -> rusqlite::Result<DestinationRecord> {
+        Ok(DestinationRecord {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: row.get(2)?,
+            uri: row.get(3)?,
+            credential_ref: row.get(4)?,
+            retention_json: row.get(5)?,
+        })
+    }
+
+    /// Opens a `pending` archive row for `snapshot_id` at `destination_id`.
+    pub fn start_archive(
+        &self,
+        snapshot_id: i64,
+        destination_id: i64,
+    ) -> Result<i64, CradleError> {
+        self.conn.execute(
+            "INSERT INTO archives (snapshot_id, destination_id, state, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                snapshot_id,
+                destination_id,
+                ArchiveState::Pending.as_str(),
+                now()
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Closes out an archive attempt. A successful restic backup is taken
+    /// as verified immediately — restic content-addresses and checksums
+    /// every blob it writes as part of the backup itself, which is a
+    /// stronger integrity guarantee than what M1's own gate can currently
+    /// give `Manifest.db` (see `verify.rs`'s doc comment). `restic check`
+    /// against the whole repo remains available as a separate, heavier
+    /// periodic audit — see `archive::check`.
+    pub fn finish_archive(
+        &self,
+        archive_id: i64,
+        state: ArchiveState,
+        restic_id: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), CradleError> {
+        let verified_at = (state == ArchiveState::Succeeded).then(now);
+        self.conn.execute(
+            "UPDATE archives SET state = ?1, restic_id = ?2, verified_at = ?3, error = ?4
+             WHERE id = ?5",
+            params![state.as_str(), restic_id, verified_at, error, archive_id],
+        )?;
+        Ok(())
+    }
+
+    /// Archive attempts for `snapshot_id`, most recent first.
+    pub fn list_archives_for_snapshot(
+        &self,
+        snapshot_id: i64,
+    ) -> Result<Vec<ArchiveRecord>, CradleError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, snapshot_id, destination_id, restic_id, state, created_at, verified_at, error
+             FROM archives WHERE snapshot_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![snapshot_id], |row| {
+                Ok(ArchiveRecord {
+                    id: row.get(0)?,
+                    snapshot_id: row.get(1)?,
+                    destination_id: row.get(2)?,
+                    restic_id: row.get(3)?,
+                    state: row.get(4)?,
+                    created_at: row.get(5)?,
+                    verified_at: row.get(6)?,
+                    error: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 }
 
