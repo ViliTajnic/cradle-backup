@@ -49,14 +49,29 @@ pub fn destination_account(destination_name: &str) -> String {
     format!("cradle-destination-{destination_name}")
 }
 
+/// The Keychain `account` a device's *backup* password lives under —
+/// different secret from a destination's repository password (this is the
+/// password the user set on-device/in Finder for encrypted backups, not
+/// one Cradle generated), but the same storage mechanism.
+pub fn device_account(udid: &str) -> String {
+    format!("cradle-device-backup-{udid}")
+}
+
 /// Generates a new random repository password and stores it in the
 /// Keychain under `account`. Returns the password so the caller can hand
 /// it straight to `restic init` without a second Keychain round trip.
 pub fn generate_and_store(account: &str) -> Result<String, CradleError> {
     let password = generate_password();
-    set_generic_password(SERVICE, account, password.as_bytes())
-        .map_err(|e| CradleError::Other(format!("could not store Keychain entry: {e}")))?;
+    store(account, &password)?;
     Ok(password)
+}
+
+/// Stores a password the caller already has — e.g. a device's backup
+/// password the user typed in, as opposed to [`generate_and_store`]'s
+/// randomly generated ones.
+pub fn store(account: &str, password: &str) -> Result<(), CradleError> {
+    set_generic_password(SERVICE, account, password.as_bytes())
+        .map_err(|e| CradleError::Other(format!("could not store Keychain entry: {e}")))
 }
 
 /// Reads a previously stored password back out of the Keychain. Only
@@ -67,6 +82,20 @@ pub fn read(account: &str) -> Result<String, CradleError> {
         .map_err(|e| CradleError::Other(format!("could not read Keychain entry: {e}")))?;
     String::from_utf8(bytes)
         .map_err(|_| CradleError::Other("Keychain entry was not valid UTF-8".into()))
+}
+
+/// Like [`read`], but a missing entry is `Ok(None)` rather than an error —
+/// for callers like verify.rs's real Manifest.db check, where "no stored
+/// backup password yet" is an expected, common case to fall back from, not
+/// a failure to report.
+pub fn try_read(account: &str) -> Result<Option<String>, CradleError> {
+    match generic_password(PasswordOptions::new_generic_password(SERVICE, account)) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| CradleError::Other("Keychain entry was not valid UTF-8".into())),
+        Err(e) if e.code() == security_framework_sys::base::errSecItemNotFound => Ok(None),
+        Err(e) => Err(CradleError::Other(format!("could not read Keychain entry: {e}"))),
+    }
 }
 
 /// Removes a destination's stored password. Used when a destination is

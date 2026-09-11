@@ -1,5 +1,5 @@
 //! Cradle CLI — M0 connect/precheck/backup, M1 verification gate, M2
-//! catalog, M3 archive layer, M4 restore.
+//! catalog, M3 archive layer, M4 restore, M5 decryption.
 //!
 //! Per CLAUDE.md, the CLI is not a debug tool: it ships, it is supported,
 //! and it is the free tier's complete interface. Restore in particular is
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use cradle_core::CradleError;
 use cradle_core::catalog::{ArchiveState, Catalog, DestinationRecord, DeviceRecord, RunKind, RunStatus};
+use cradle_core::crypto::Keybag;
 use cradle_core::{archive, backup, device, keychain, precheck, restore, verify};
 
 use progress::{TerminalProgress, human_bytes};
@@ -54,6 +55,39 @@ enum Command {
     History {
         #[arg(long)]
         udid: String,
+    },
+    /// Manage a device's backup password in the macOS Keychain.
+    ///
+    /// Storing it unlocks the real `Manifest.db` integrity check on
+    /// `cradle backup` (see `verify.rs`) instead of the reduced one, and
+    /// is needed for `cradle decrypt`. This is the password set on the
+    /// *device* (Settings/Finder's "Encrypted Backup") — Cradle never
+    /// generates or changes it.
+    Password {
+        #[command(subcommand)]
+        command: PasswordCommand,
+    },
+    /// Decrypts a single file from a backup using its stored password.
+    ///
+    /// Needs the `Manifest.db` row's own `EncryptionKey` for the target
+    /// file, which nothing in Cradle currently looks up by domain/path —
+    /// pass `--encryption-key <hex>` directly until manifest browsing
+    /// exists (see `crypto.rs`'s module doc for that gap).
+    Decrypt {
+        #[arg(long)]
+        udid: Option<String>,
+        #[arg(long, default_value = "working")]
+        working_dir: PathBuf,
+        /// Path (relative to the backup root) to the encrypted file.
+        #[arg(long)]
+        input: PathBuf,
+        /// Where to write the decrypted output.
+        #[arg(long)]
+        output: PathBuf,
+        /// The file's wrapped encryption key, hex-encoded — from
+        /// `Manifest.db`'s `Files.file` blob's `EncryptionKey` field.
+        #[arg(long)]
+        encryption_key: String,
     },
     /// Restores a backup onto a device. Free, unconditional, forever — no
     /// license check, no network call (CLAUDE.md non-negotiable #1).
@@ -100,6 +134,24 @@ enum Command {
     Archive {
         #[command(subcommand)]
         command: ArchiveCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PasswordCommand {
+    /// Store a device's backup password. Prompts with hidden input if
+    /// `--password` isn't given (preferred — `--password` is visible in
+    /// shell history and process listings for as long as this runs).
+    Set {
+        #[arg(long)]
+        udid: String,
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Remove a device's stored backup password.
+    Forget {
+        #[arg(long)]
+        udid: String,
     },
 }
 
@@ -216,6 +268,14 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Password { command } => run_password(command),
+        Command::Decrypt {
+            udid,
+            working_dir,
+            input,
+            output,
+            encryption_key,
+        } => run_decrypt(udid, working_dir, input, output, encryption_key).await,
     }
 }
 
@@ -336,7 +396,17 @@ async fn run_backup(
         progress.finish();
 
         println!("Verifying backup...");
-        let gate = verify::run(&outcome.backup_dir, outcome.files_received).await?;
+        // A stored backup password unlocks the real Manifest.db integrity
+        // check instead of the reduced one — see verify.rs's module doc.
+        // Not finding one is the common case, not an error: nothing here
+        // prompts for it mid-backup.
+        let stored_password = keychain::try_read(&keychain::device_account(&udid))?;
+        let gate = verify::run(
+            &outcome.backup_dir,
+            outcome.files_received,
+            stored_password.as_deref(),
+        )
+        .await?;
         Ok((outcome, gate))
     }
     .await;
@@ -358,10 +428,15 @@ async fn run_backup(
                 true,
             )?;
             println!(
-                "Backup verified: {} ({} files, {}).",
+                "Backup verified: {} ({} files, {}, Manifest.db integrity {}).",
                 outcome.backup_dir.display(),
                 gate.files_on_disk,
-                human_bytes(gate.total_bytes)
+                human_bytes(gate.total_bytes),
+                if gate.manifest_integrity_checked {
+                    "confirmed"
+                } else {
+                    "not checked — no stored backup password; see `cradle password set`"
+                }
             );
             Ok(())
         }
@@ -399,9 +474,13 @@ fn gate_problems(gate: &verify::Report) -> Vec<String> {
         );
     }
     if !gate.manifest_present {
-        problems.push(
-            "Manifest.db is missing, empty, or truncated — it did not arrive intact.".to_string(),
-        );
+        problems.push(if gate.manifest_integrity_checked {
+            "Manifest.db failed PRAGMA integrity_check after decryption — it's corrupt, not \
+             just incomplete."
+                .to_string()
+        } else {
+            "Manifest.db is missing, empty, or truncated — it did not arrive intact.".to_string()
+        });
     }
     if !gate.file_count_match {
         problems.push(format!(
@@ -781,4 +860,61 @@ async fn run_restore(
             Err(e.into())
         }
     }
+}
+
+fn run_password(command: PasswordCommand) -> anyhow::Result<()> {
+    match command {
+        PasswordCommand::Set { udid, password } => {
+            let password = match password {
+                Some(p) => p,
+                None => rpassword::prompt_password("Backup password: ")?,
+            };
+            if password.is_empty() {
+                anyhow::bail!("Password was empty — not storing it.");
+            }
+            keychain::store(&keychain::device_account(&udid), &password)?;
+            println!("Stored the backup password for {udid} in the Keychain.");
+            Ok(())
+        }
+        PasswordCommand::Forget { udid } => {
+            keychain::delete(&keychain::device_account(&udid))?;
+            println!("Removed the stored backup password for {udid}.");
+            Ok(())
+        }
+    }
+}
+
+async fn run_decrypt(
+    udid: Option<String>,
+    working_root: PathBuf,
+    input: PathBuf,
+    output: PathBuf,
+    encryption_key_hex: String,
+) -> anyhow::Result<()> {
+    let udid = resolve_udid(udid).await?;
+    let password = keychain::try_read(&keychain::device_account(&udid))?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No stored backup password for {udid} — run `cradle password set --udid {udid}` first."
+        )
+    })?;
+
+    let backup_dir = working_root.join(&udid);
+    let keybag = Keybag::unlock_from_backup_dir(&backup_dir, &password)?;
+
+    let encryption_key = hex::decode(encryption_key_hex.trim())
+        .map_err(|e| anyhow::anyhow!("--encryption-key is not valid hex: {e}"))?;
+    let ciphertext = std::fs::read(backup_dir.join(&input))
+        .map_err(|e| anyhow::anyhow!("could not read {}: {e}", input.display()))?;
+    let decrypted = keybag.decrypt(&ciphertext, &encryption_key)?;
+
+    std::fs::write(&output, &decrypted)
+        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", output.display()))?;
+    println!(
+        "Decrypted {} ({} bytes) to {}. Note: output may have trailing pad bytes past the \
+         file's true size — see crypto.rs's `Keybag::decrypt` doc if that matters for this file.",
+        input.display(),
+        decrypted.len(),
+        output.display()
+    );
+    Ok(())
 }

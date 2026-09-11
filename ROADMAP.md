@@ -177,13 +177,61 @@ building has continued through M7 with real backup-and-restore-to-another-
 device testing deferred to once the whole stack exists — see the top of
 this file for the same deferral on M0.
 
-## M5 — Crypto layer
+## M5 — Crypto layer 🟡 built, unverified against a real device's keybag
 
 Parse `BackupKeyBag` from Manifest.plist → PBKDF2 → unwrap class keys →
 AES-256-CBC per file. Needed to open an encrypted `Manifest.db`.
 
 Unlocks manifest browsing and raw extraction. Budget a full day; this is
 fiddly but well documented.
+
+`crypto.rs` is a faithful port of
+[doronz88/pyiosbackup](https://github.com/doronz88/pyiosbackup)'s
+`keybag.py` — a proven implementation `pymobiledevice3` itself depends on
+— fetched and read line by line rather than reconstructed from blog posts,
+because this is exactly the kind of code where "close enough" produces
+silent wrong answers. Two details worth flagging for anyone touching this
+again, both easy to get backwards: keybag TLV integers (`ITER`, `DPIC`,
+`CLAS`, `WRAP`) are big-endian, but the 4-byte class id prefixing a *file's*
+wrapped key is little-endian; and the two-stage PBKDF2 (SHA-256 over
+`DPSL`/`DPIC` first, then SHA-1 over `SALT`/`ITER` using *that* result as
+the password) only runs when `DPSL`/`DPIC` are present — checked directly
+rather than gated on the backup's iOS version like the reference does,
+since that means this module never needs to know anything about
+`Manifest.plist` beyond the keybag bytes it's handed.
+
+Found a real gap doing this: nothing built in M0-M4 ever asked for or
+stored the backup *password* itself (distinct from a restic repository's
+own generated password) — nothing needed it before. Added `cradle password
+set/forget --udid <UDID>` (Keychain-backed, same `security-framework`
+approach as destinations, hidden prompt via `rpassword` unless
+`--password` is given) and wired a lookup into `cradle backup`'s
+post-backup verify step: a stored password unlocks the real `PRAGMA
+integrity_check`, no password falls back to M1's reduced check — nothing
+forces an interactive prompt into the middle of an otherwise-unattended
+backup.
+
+**Deliberately not built**: manifest *browsing* (listing files by
+domain/path) needs an NSKeyedArchiver decoder for `Manifest.db`'s `Files`
+table `file` BLOB column — a separate, non-trivial parsing format, not
+scoped into this pass. `cradle decrypt` covers raw extraction in reduced
+form: it decrypts one file given its `--encryption-key` directly (hex,
+read manually from a decrypted `Manifest.db` for now), rather than looking
+files up by domain/path itself.
+
+Crypto core is unit-tested against self-constructed synthetic keybags
+(correct-password unlock, wrong-password rejection via AES-KW's own
+integrity check, a full wrap→encrypt→decrypt→unwrap round trip, rejecting
+non-block-aligned ciphertext) — internally consistent, but not yet checked
+against a *real* device's actual `BackupKeyBag` and `Manifest.db`, which
+needs the same real-device pass everything since M0 is waiting on.
+`cradle password set/forget` were smoke-tested against the real macOS
+Keychain. One methodology note for whoever debugs this next: verifying a
+Cradle-stored Keychain item with the `security` CLI (`security
+find-generic-password -w ...`) hits the exact same cross-process
+authorization-prompt hang documented in M3 — use `cradle password
+set/forget` to inspect or clean up Cradle's own Keychain entries, never
+the `security` CLI directly.
 
 ## M6 — CLI v1.0
 

@@ -6,12 +6,12 @@ real progress instead of an indeterminate spinner.
 
 See [`CLAUDE.md`](./CLAUDE.md) for the project's non-negotiables and
 architecture, and [`ROADMAP.md`](./ROADMAP.md) for the milestone plan. This
-repo is at **M4** — protocol spike + verification gate + catalog + archive
-layer + restore, partially verified against real hardware and real
-infrastructure. Building has continued through M7 with a real
-backup-and-restore-to-another-device test deliberately deferred until the
-whole stack exists — see `ROADMAP.md` for exactly what has and hasn't been
-exercised at each milestone.
+repo is at **M5** — protocol spike + verification gate + catalog + archive
+layer + restore + backup decryption, partially verified against real
+hardware and real infrastructure. Building has continued through M7 with a
+real backup-and-restore-to-another-device test deliberately deferred until
+the whole stack exists — see `ROADMAP.md` for exactly what has and hasn't
+been exercised at each milestone.
 
 ## Status
 
@@ -23,13 +23,9 @@ the backup. **Not yet confirmed: a full backup completing, and the second
 run being dramatically faster than the first** — the one real transfer so
 far was deliberately stopped partway through as a smoke test. Per
 `ROADMAP.md`, that's the exit criterion that actually validates the
-project's core architecture assumption, and M0-M2's checkmarks reflect
-exactly what has and hasn't been exercised yet — see the top of that file.
-
-M1's verification gate is intentionally reduced-scope until M5's crypto
-layer exists: see the doc comment at the top of
-`crates/cradle-core/src/verify.rs` for what's checked now versus what
-`CLAUDE.md` specifies.
+project's core architecture assumption, and every milestone's checkmarks
+reflect exactly what has and hasn't been exercised — see the top of that
+file.
 
 M3's archive layer is integration-tested against a real `restic` binary and
 the real macOS Keychain (not just unit tests) — see `ROADMAP.md`'s M3
@@ -40,16 +36,26 @@ M4's restore path is built and its staging/precheck logic exercised for
 real, but the actual on-device restore protocol call has not yet run
 against a real target device — see `ROADMAP.md`'s M4 section.
 
+M5's crypto layer (`BackupKeyBag` parsing, PBKDF2, AES-256-CBC) is a
+faithful port of a proven reference implementation, unit-tested against
+self-constructed keybags, but not yet checked against a real device's
+actual keybag — see `ROADMAP.md`'s M5 section, including a real Keychain
+authorization-prompt hang that testing caught (same class of bug as M3's).
+M1's verification gate now does the real `PRAGMA integrity_check` when a
+backup password has been stored (`cradle password set`); without one it
+still falls back to the reduced check from M1's original build.
+
 ## Layout
 
 - `crates/cradle-core` — device discovery, prechecks, the `mobilebackup2`
   backup path, the post-backup verification gate, the catalog
   (`devices`/`runs`/`snapshots`/`destinations`/`archives` in SQLite), the
-  restic-backed archive layer, Keychain access for repository passwords,
-  and restore (including cross-device migration). No UI yet (M7).
+  restic-backed archive layer, Keychain access, restore (including
+  cross-device migration), and backup decryption. No UI yet (M7).
 - `crates/cradle-cli` — the `cradle` binary: `cradle devices`,
   `cradle backup`, `cradle history`, `cradle destination add/list`,
-  `cradle archive run/list/prune/check`, `cradle restore`.
+  `cradle archive run/list/prune/check`, `cradle restore`,
+  `cradle password set/forget`, `cradle decrypt`.
 
 ## Building
 
@@ -80,6 +86,9 @@ cradle archive check --destination nas      # full repo integrity check
 cradle restore --udid <UDID>                              # restore a device's own backup onto itself
 cradle restore --udid <NEW_UDID> --source-udid <OLD_UDID> # cross-device migration
 cradle restore --udid <UDID> --from-archive nas --restic-snapshot <id>
+
+cradle password set --udid <UDID>           # store the backup password (hidden prompt)
+cradle decrypt --udid <UDID> --input <relative-path> --output <file> --encryption-key <hex>
 ```
 
 `working/` is the canonical working directory (see `CLAUDE.md`): it is
@@ -95,9 +104,14 @@ M1 verification gate.
 
 The catalog lives at the platform data directory by default (e.g.
 `~/Library/Application Support/Cradle/catalog.db` on macOS) — override with
-`--catalog <path>` on any command. Each destination's restic repository
-password is generated automatically and stored in the macOS Keychain,
-never in the catalog or anywhere on disk in the clear.
+`--catalog <path>` on any command. Every stored secret (a destination's
+restic repository password, a device's backup password) is generated or
+supplied once and kept in the macOS Keychain, never in the catalog or
+anywhere on disk in the clear. **Never inspect Cradle's own Keychain
+entries with the `security` CLI** — reading an item Cradle created from a
+different process triggers a macOS authorization dialog with no terminal
+to answer it (see `ROADMAP.md`'s M3 and M5 sections). Use `cradle password
+forget` / re-run `cradle destination add` instead.
 
 ## License
 

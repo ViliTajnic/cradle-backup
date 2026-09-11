@@ -7,23 +7,22 @@
 //! 2. `Manifest.db` opens and passes `PRAGMA integrity_check`
 //! 3. File count matches the manifest
 //!
-//! **Gap against that spec, by design for now:** when backup encryption is
-//! on — which non-negotiable #2 in CLAUDE.md requires for every backup
-//! Cradle makes — `Manifest.db` is itself an AES-encrypted blob, not a
-//! plain SQLite file. Decrypting it needs the `BackupKeyBag` /
-//! PBKDF2 / class-key machinery scheduled for `ROADMAP.md` M5, four
-//! milestones out. Until that lands:
+//! Check 1 has always been the real thing. Checks 2 and 3 started
+//! reduced-scope (M1) because backup encryption — required by
+//! non-negotiable #2 — makes `Manifest.db` an AES-encrypted blob, not a
+//! plain SQLite file, and decrypting it needed the `crypto` module M5
+//! added. Check 2 is now the real thing too, *when a backup password is
+//! available* (see [`run`]'s `password` parameter): decrypt `Manifest.db`
+//! via [`crate::crypto::Keybag`] and run `PRAGMA integrity_check` on the
+//! result. Without a password on hand, it falls back to the M1-era check
+//! (ciphertext present, non-empty, AES-block-aligned) rather than forcing
+//! an interactive prompt into the middle of a backup run — callers decide
+//! whether to look one up first (see `keychain::try_read`).
 //!
-//! - Check 2 becomes: `Manifest.db` exists, is non-empty, and (for an
-//!   encrypted backup) its ciphertext length is AES-block-aligned. That
-//!   catches truncation and corruption but not row-level damage.
-//! - Check 3 becomes: the number of files actually written to disk under
-//!   the backup directory equals the number of files the device told the
-//!   delegate it sent during *this run* — not a query against
-//!   `Manifest.db`'s `Files` table, which isn't readable yet either.
-//!
-//! Both checks should be swapped for the literal spec once M5 exists —
-//! search for `M5` in this file.
+//! Check 3 is still reduced-scope: on-disk file count against what the
+//! delegate was told to expect, not a `SELECT COUNT(*) FROM Files` against
+//! the manifest. Nothing blocks that upgrade now that `Manifest.db` is
+//! readable — it just isn't built yet.
 
 use std::path::Path;
 
@@ -37,6 +36,10 @@ const AES_BLOCK_SIZE: u64 = 16;
 pub struct Report {
     pub status_finished: bool,
     pub manifest_present: bool,
+    /// `true` if `manifest_present` reflects a real `PRAGMA
+    /// integrity_check` on decrypted data, `false` if it's the reduced
+    /// ciphertext-shape check (no password was available).
+    pub manifest_integrity_checked: bool,
     pub files_on_disk: u64,
     pub files_reported: u64,
     pub file_count_match: bool,
@@ -59,24 +62,37 @@ impl Report {
 
 /// Runs the verification gate against `backup_dir` (a `working/<UDID>/`
 /// snapshot). `files_reported` is [`crate::backup::Outcome::files_received`]
-/// from the run that just finished.
-pub async fn run(backup_dir: &Path, files_reported: u64) -> Result<Report, CradleError> {
+/// from the run that just finished. `password`, if given, unlocks the real
+/// `Manifest.db` integrity check instead of the reduced ciphertext-shape
+/// one — see the module doc.
+pub async fn run(
+    backup_dir: &Path,
+    files_reported: u64,
+    password: Option<&str>,
+) -> Result<Report, CradleError> {
     let dir = backup_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || run_blocking(&dir, files_reported))
+    let password = password.map(str::to_string);
+    tokio::task::spawn_blocking(move || run_blocking(&dir, files_reported, password.as_deref()))
         .await
         .map_err(|e| CradleError::Other(format!("verification gate task panicked: {e}")))?
 }
 
-fn run_blocking(backup_dir: &Path, files_reported: u64) -> Result<Report, CradleError> {
+fn run_blocking(
+    backup_dir: &Path,
+    files_reported: u64,
+    password: Option<&str>,
+) -> Result<Report, CradleError> {
     let status_finished = status_finished(backup_dir);
     let encrypted = backup_is_encrypted(backup_dir);
-    let manifest_present = manifest_db_present(backup_dir, encrypted);
+    let (manifest_present, manifest_integrity_checked) =
+        manifest_db_ok(backup_dir, encrypted, password);
     let (files_on_disk, total_bytes) = scan_backup_dir(backup_dir)?;
     let file_count_match = files_on_disk == files_reported;
 
     Ok(Report {
         status_finished,
         manifest_present,
+        manifest_integrity_checked,
         files_on_disk,
         files_reported,
         file_count_match,
@@ -113,13 +129,27 @@ fn backup_is_encrypted(backup_dir: &Path) -> bool {
         .unwrap_or(true)
 }
 
-/// Check 2 (reduced scope — see module docs): `Manifest.db` exists, is
-/// non-empty, and — for an encrypted backup — is AES-block-aligned.
-///
-/// # M5
-/// Replace with: decrypt using the manifest key unwrapped from
-/// `Manifest.plist`'s `BackupKeyBag`, open with `rusqlite`, run
-/// `PRAGMA integrity_check`.
+/// Check 2's dispatcher: real `PRAGMA integrity_check` when `password` is
+/// given and decryption succeeds, otherwise the reduced ciphertext-shape
+/// check. Returns `(passed, was_real_check)`.
+fn manifest_db_ok(backup_dir: &Path, encrypted: bool, password: Option<&str>) -> (bool, bool) {
+    if let Some(password) = password
+        && encrypted
+    {
+        match real_manifest_integrity_check(backup_dir, password) {
+            Ok(ok) => return (ok, true),
+            // A password that's present but wrong, or any other failure
+            // decrypting, is a real gate failure — not a reason to fall
+            // back to the weaker check, which could mask exactly that.
+            Err(_) => return (false, true),
+        }
+    }
+    (manifest_db_present(backup_dir, encrypted), false)
+}
+
+/// Check 2, reduced scope (see module docs): `Manifest.db` exists, is
+/// non-empty, and — for an encrypted backup — is AES-block-aligned. Used
+/// when no backup password is available to run the real check.
 fn manifest_db_present(backup_dir: &Path, encrypted: bool) -> bool {
     let Ok(meta) = std::fs::metadata(backup_dir.join("Manifest.db")) else {
         return false;
@@ -128,6 +158,72 @@ fn manifest_db_present(backup_dir: &Path, encrypted: bool) -> bool {
         return false;
     }
     !encrypted || meta.len() % AES_BLOCK_SIZE == 0
+}
+
+/// Check 2, real spec: decrypt `Manifest.db` with the keybag unlocked by
+/// `password`, write it to a private (0600 on Unix) temp file, open with
+/// `rusqlite`, and run `PRAGMA integrity_check`. The temp file is removed
+/// on every exit path via [`TempManifestFile`]'s `Drop` — a decrypted
+/// backup manifest (Keychain/Health/message metadata) sitting in `/tmp`
+/// any longer than it has to is exactly the kind of thing non-negotiable
+/// #2 exists to avoid.
+fn real_manifest_integrity_check(backup_dir: &Path, password: &str) -> Result<bool, CradleError> {
+    let manifest_plist = plist::Value::from_file(backup_dir.join("Manifest.plist"))
+        .map_err(|e| CradleError::Other(format!("could not read Manifest.plist: {e}")))?;
+    let manifest_key = manifest_plist
+        .as_dictionary()
+        .and_then(|d| d.get("ManifestKey"))
+        .and_then(|v| v.as_data())
+        .ok_or_else(|| CradleError::Other("Manifest.plist has no ManifestKey".into()))?;
+
+    let keybag = crate::crypto::Keybag::unlock_from_backup_dir(backup_dir, password)?;
+    let ciphertext = std::fs::read(backup_dir.join("Manifest.db"))?;
+    let decrypted = keybag.decrypt(&ciphertext, manifest_key)?;
+
+    let temp = TempManifestFile::write(&decrypted)?;
+    let conn = rusqlite::Connection::open(&temp.0)?;
+    let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    Ok(result == "ok")
+}
+
+/// A decrypted `Manifest.db` written to a private temp file, deleted on
+/// drop regardless of how the caller's function returns.
+struct TempManifestFile(std::path::PathBuf);
+
+impl TempManifestFile {
+    fn write(decrypted: &[u8]) -> Result<Self, CradleError> {
+        let path = std::env::temp_dir().join(format!(
+            "cradle-manifest-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            std::io::Write::write_all(&mut file, decrypted)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&path, decrypted)?;
+        }
+
+        Ok(Self(path))
+    }
+}
+
+impl Drop for TempManifestFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Check 3 (reduced scope — see module docs): counts every regular file

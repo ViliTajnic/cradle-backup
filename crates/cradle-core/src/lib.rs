@@ -1,17 +1,20 @@
 //! Device protocol, prechecks, backup orchestration, the catalog, the
-//! archive layer, and restore for Cradle.
+//! archive layer, restore, and backup decryption for Cradle.
 //!
-//! M0-M4 scope only (see `/ROADMAP.md`): connect to a device over
+//! M0-M5 scope (see `/ROADMAP.md`): connect to a device over
 //! `mobilebackup2`, run prechecks, perform a backup into the canonical
 //! working directory with honest progress reporting, verify it, record it
 //! in a small local catalog, archive it out to a restic-backed
-//! destination, and restore it back onto a device — free and unconditional
-//! per CLAUDE.md's non-negotiable #1. No crypto layer yet (M5): manifest
-//! browsing and raw extraction of encrypted backups still aren't possible.
+//! destination, restore it back onto a device — free and unconditional per
+//! CLAUDE.md's non-negotiable #1 — and, given the backup password, decrypt
+//! `Manifest.db` and individual files. Manifest *browsing* (listing files
+//! by domain/path, which needs an NSKeyedArchiver decoder) isn't built
+//! yet — see `crypto.rs`'s module doc.
 
 pub mod archive;
 pub mod backup;
 pub mod catalog;
+pub mod crypto;
 pub mod device;
 pub mod keychain;
 pub mod precheck;
