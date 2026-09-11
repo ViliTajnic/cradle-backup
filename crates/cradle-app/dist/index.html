@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cradle</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8;
+    --panel: #ffffff;
+    --border: #e2e2e5;
+    --text: #1c1c1e;
+    --muted: #6b6b70;
+    --accent: #2f6fed;
+    --accent-weak: #eaf0fe;
+    --ok: #1f9254;
+    --ok-weak: #eafaf1;
+    --bad: #c4342b;
+    --bad-weak: #fdecea;
+    --warn: #b6650a;
+    --warn-weak: #fdf2e2;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a;
+      --panel: #212226;
+      --border: #34353a;
+      --text: #f2f2f3;
+      --muted: #98989e;
+      --accent: #5b8bf5;
+      --accent-weak: #1c2740;
+      --ok: #3fce85;
+      --ok-weak: #103322;
+      --bad: #ff6b62;
+      --bad-weak: #3a1614;
+      --warn: #e2a03f;
+      --warn-weak: #3a2a0c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    -webkit-app-region: drag;
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  header button { -webkit-app-region: no-drag; }
+  main { flex: 1; overflow: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .panel h2 {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 0 0 12px;
+  }
+  button {
+    font: inherit;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 7px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+    font-weight: 600;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button:not(:disabled):hover { filter: brightness(0.97); }
+  .device-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 12px;
+  }
+  .device-row:last-child { border-bottom: none; }
+  .device-name { font-weight: 600; }
+  .device-meta { color: var(--muted); font-size: 12px; }
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+  }
+  .badge.ok { background: var(--ok-weak); color: var(--ok); }
+  .badge.bad { background: var(--bad-weak); color: var(--bad); }
+  .badge.warn { background: var(--warn-weak); color: var(--warn); }
+  .empty { color: var(--muted); padding: 8px 0; }
+  .progress-track {
+    height: 8px;
+    border-radius: 999px;
+    background: var(--accent-weak);
+    overflow: hidden;
+    margin: 10px 0;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.2s ease;
+  }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .stat { text-align: left; }
+  .stat .value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+  .attention-banner {
+    background: var(--warn-weak);
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    display: none;
+  }
+  .attention-banner.show { display: block; }
+  .status-line { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .result { border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 13px; }
+  .result.ok { background: var(--ok-weak); color: var(--ok); }
+  .result.bad { background: var(--bad-weak); color: var(--bad); }
+  .result ul { margin: 6px 0 0; padding-left: 18px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 10px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Cradle</h1>
+    <button id="refresh">Refresh devices</button>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>Devices</h2>
+      <div id="devices" class="empty">Looking for devices…</div>
+    </section>
+
+    <section class="panel" id="backup-panel" style="display:none;">
+      <h2>Backup — <span id="backup-device-name"></span></h2>
+      <div id="attention" class="attention-banner">Look at your device now — enter your passcode or use Face ID/Touch ID to continue.</div>
+      <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+      <div class="stat-grid">
+        <div class="stat"><div id="stat-pct" class="value">—</div><div class="label">Progress</div></div>
+        <div class="stat"><div id="stat-files" class="value">0</div><div class="label">Files</div></div>
+        <div class="stat"><div id="stat-rate" class="value">—</div><div class="label">Rate</div></div>
+        <div class="stat"><div id="stat-eta" class="value">—</div><div class="label">ETA</div></div>
+      </div>
+      <div id="backup-status" class="status-line"></div>
+      <div id="backup-result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>History — <span id="history-device-name">select a device</span></h2>
+      <div id="history" class="empty">No device selected.</div>
+    </section>
+  </main>
+</div>
+
+<script>
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+
+let selectedUdid = null;
+let backupStart = null;
+
+function humanBytes(bytes) {
+  if (bytes == null) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = bytes, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(1)} ${units[i]}`;
+}
+
+function humanDuration(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return "—";
+  const s = Math.floor(seconds);
+  const h = String(Math.floor(s / 3600)).padStart(2, "0");
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const sec = String(s % 60).padStart(2, "0");
+  return `${h}:${m}:${sec}`;
+}
+
+function renderDevices(devices) {
+  const el = document.getElementById("devices");
+  if (!devices.length) {
+    el.className = "empty";
+    el.textContent = "No devices attached. Connect an iPhone or iPad and unlock it.";
+    return;
+  }
+  el.className = "";
+  el.innerHTML = "";
+  for (const d of devices) {
+    const row = document.createElement("div");
+    row.className = "device-row";
+
+    const info = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "device-name";
+    name.textContent = d.name ?? d.udid;
+    const meta = document.createElement("div");
+    meta.className = "device-meta";
+    meta.textContent = d.reachable
+      ? `${d.product_type ?? ""} · iOS ${d.ios_version ?? "?"} · ${d.transport}`
+      : (d.pairing_message ?? "Unreachable");
+    info.appendChild(name);
+    info.appendChild(meta);
+
+    const right = document.createElement("div");
+    right.style.display = "flex";
+    right.style.alignItems = "center";
+    right.style.gap = "10px";
+
+    const badge = document.createElement("span");
+    badge.className = "badge " + (d.reachable ? "ok" : "warn");
+    badge.textContent = d.reachable ? "Ready" : "Not paired";
+    right.appendChild(badge);
+
+    const btn = document.createElement("button");
+    btn.className = "primary";
+    btn.textContent = "Back Up";
+    btn.disabled = !d.reachable;
+    btn.onclick = () => startBackup(d);
+    right.appendChild(btn);
+
+    const histBtn = document.createElement("button");
+    histBtn.textContent = "History";
+    histBtn.onclick = () => showHistory(d);
+    right.appendChild(histBtn);
+
+    row.appendChild(info);
+    row.appendChild(right);
+    el.appendChild(row);
+  }
+}
+
+async function refreshDevices() {
+  const btn = document.getElementById("refresh");
+  btn.disabled = true;
+  try {
+    const devices = await invoke("list_devices");
+    renderDevices(devices);
+  } catch (e) {
+    document.getElementById("devices").textContent = "Error: " + e;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function resetBackupUi(name) {
+  document.getElementById("backup-panel").style.display = "block";
+  document.getElementById("backup-device-name").textContent = name;
+  document.getElementById("attention").classList.remove("show");
+  document.getElementById("progress-fill").style.width = "0%";
+  document.getElementById("stat-pct").textContent = "—";
+  document.getElementById("stat-files").textContent = "0";
+  document.getElementById("stat-rate").textContent = "—";
+  document.getElementById("stat-eta").textContent = "—";
+  document.getElementById("backup-status").textContent = "Starting…";
+  document.getElementById("backup-result").innerHTML = "";
+  backupStart = performance.now();
+}
+
+async function startBackup(device) {
+  resetBackupUi(device.name ?? device.udid);
+  try {
+    const summary = await invoke("run_backup", { udid: device.udid });
+    const result = document.getElementById("backup-result");
+    if (summary.verified) {
+      result.innerHTML = `<div class="result ok">Verified: ${summary.files} files, ${humanBytes(summary.bytes)}.
+        Manifest.db integrity ${summary.manifest_integrity_checked ? "confirmed" : "not checked — no stored backup password"}.
+        <br><small>${summary.backup_dir}</small></div>`;
+    } else {
+      const items = summary.problems.map(p => `<li>${p}</li>`).join("");
+      result.innerHTML = `<div class="result bad">Backup did not pass verification.<ul>${items}</ul></div>`;
+    }
+    document.getElementById("backup-status").textContent = "Done.";
+    refreshDevices();
+  } catch (e) {
+    document.getElementById("backup-result").innerHTML = `<div class="result bad">${e}</div>`;
+    document.getElementById("backup-status").textContent = "Failed.";
+  }
+}
+
+async function showHistory(device) {
+  selectedUdid = device.udid;
+  document.getElementById("history-device-name").textContent = device.name ?? device.udid;
+  const el = document.getElementById("history");
+  try {
+    const runs = await invoke("get_history", { udid: device.udid });
+    if (!runs.length) {
+      el.className = "empty";
+      el.textContent = "No runs recorded yet.";
+      return;
+    }
+    el.className = "";
+    const rows = runs.map(r => `
+      <tr>
+        <td>#${r.id}</td>
+        <td>${r.kind}</td>
+        <td>${r.status}</td>
+        <td>${new Date(r.started_at * 1000).toLocaleString()}</td>
+        <td>${r.bytes != null ? humanBytes(r.bytes) : "—"}</td>
+        <td>${r.files ?? "—"}</td>
+        <td>${r.error ?? ""}</td>
+      </tr>`).join("");
+    el.innerHTML = `<table><thead><tr><th>Run</th><th>Kind</th><th>Status</th><th>Started</th><th>Bytes</th><th>Files</th><th>Error</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch (e) {
+    el.className = "empty";
+    el.textContent = "Error: " + e;
+  }
+}
+
+listen("backup-progress", (event) => {
+  const { files, bytes_done, bytes_total, overall_progress } = event.payload;
+  const pct = overall_progress >= 0 ? overall_progress
+    : (bytes_total > 0 ? (bytes_done / bytes_total) * 100 : null);
+
+  document.getElementById("stat-files").textContent = files;
+  document.getElementById("progress-fill").style.width = (pct ?? 0) + "%";
+  document.getElementById("stat-pct").textContent = pct != null ? pct.toFixed(1) + "%" : "—";
+
+  const elapsed = (performance.now() - backupStart) / 1000;
+  const rate = elapsed > 0 ? bytes_done / elapsed : 0;
+  document.getElementById("stat-rate").textContent = humanBytes(rate) + "/s";
+
+  if (pct != null && pct > 0 && pct < 100) {
+    const eta = (elapsed / pct) * (100 - pct);
+    document.getElementById("stat-eta").textContent = humanDuration(eta);
+  }
+});
+
+listen("backup-attention", (event) => {
+  document.getElementById("attention").classList.toggle("show", event.payload === true);
+});
+
+listen("backup-status", (event) => {
+  document.getElementById("backup-status").textContent = event.payload;
+});
+
+listen("backup-retry", (event) => {
+  const { attempt, max } = event.payload;
+  document.getElementById("backup-status").textContent =
+    `Device locked mid-backup — unlock it now. Retrying (attempt ${attempt}/${max})…`;
+});
+
+document.getElementById("refresh").onclick = refreshDevices;
+refreshDevices();
+</script>
+</body>
+</html>

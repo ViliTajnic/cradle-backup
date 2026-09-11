@@ -1,0 +1,24 @@
+[package]
+name = "cradle-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cradle desktop app — backup and restore for iPhone and iPad."
+
+[lib]
+name = "cradle_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+cradle-core = { path = "../cradle-core" }
+tauri = "2"
+tauri-plugin-log = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+log = "0.4"
+dirs = "7.0.0"

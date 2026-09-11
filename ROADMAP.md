@@ -262,10 +262,47 @@ features:
   printing a completion script is fully offline and has no reason to
   depend on, or fail because of, something it has nothing to do with.
 
-## M7 — Tauri UI
+## M7 — Tauri UI 🟡 built, launches, unverified visually
 
 The progress rendering is the whole point. Files done/total, bytes/sec,
 ETA, current domain. Never an indeterminate spinner.
+
+`crates/cradle-app` — a Tauri 2 shell, plain HTML/CSS/JS frontend (no
+npm build step; `withGlobalTauri: true` so `window.__TAURI__` is
+available without a bundler). Three commands (`list_devices`,
+`run_backup`, `get_history`) wrap the same `cradle-core` calls the CLI
+uses — no parallel implementation of the protocol/catalog/verify logic.
+
+Progress reaches the webview the same way `TerminalProgress` reaches the
+terminal: a `TauriProgress` (`src/progress.rs`) implements
+`backup::ProgressSink` and emits `backup-progress` / `backup-attention`
+events instead of printing a line, so the on-device passcode/Face ID
+signal from M0 (`on_attention_needed`) shows as a banner in the UI, not
+just CLI text — the whole reason that hook exists on the trait rather
+than being CLI-specific.
+
+**Known, accepted duplication**: `commands::run_backup` re-implements the
+precheck → backup → verify → catalog sequence `cradle-cli`'s own
+`run_backup` already has, rather than both calling one shared
+orchestration function in `cradle-core`. Extracting that is a reasonable
+follow-up now that there are two real call sites with identical needs —
+not done here because this session was already very long and the two
+implementations' actual shape (what a GUI needs back at each step vs.
+what the CLI prints) hadn't settled yet. See `commands.rs`'s module doc.
+
+**Status**: builds clean, clippy clean, and the app launches — a real
+window opens and becomes key (confirmed via `tao`'s own event log, not
+just "process didn't crash"). Everything past that — whether the device
+list actually populates, whether a live backup run renders correctly,
+whether the attention banner and history table work — needs eyes on an
+actual running window, which nothing in this environment can substitute
+for. Unverified, same as the rest of the stack pending the real-device
+pass planned after M7.
+
+Not built: `cradle archive` / `cradle restore` / `cradle password` have
+no UI commands yet — `list_devices`, `run_backup`, and `get_history` are
+the M7 minimum to prove the architecture (a working webview driving
+`cradle-core` with real progress events), not full parity with the CLI.
 
 ## M8 — Signing and distribution
 

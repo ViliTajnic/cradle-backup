@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cradle-core", "crates/cradle-cli"]
+members = ["crates/cradle-core", "crates/cradle-cli", "crates/cradle-app"]
 
 [workspace.package]
 version = "0.1.0"

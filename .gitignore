@@ -1,6 +1,9 @@
 /target
 Cargo.lock
 
+# Tauri's generated platform schemas/bundling scaffolding.
+crates/cradle-app/gen/
+
 # The canonical working set (see CLAUDE.md: "working/<UDID>/ is canonical").
 # It holds live device backup data and must never be committed.
 /working/

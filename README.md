@@ -6,12 +6,13 @@ real progress instead of an indeterminate spinner.
 
 See [`CLAUDE.md`](./CLAUDE.md) for the project's non-negotiables and
 architecture, and [`ROADMAP.md`](./ROADMAP.md) for the milestone plan. This
-repo is at **M6** — protocol spike + verification gate + catalog + archive
-layer + restore + backup decryption + a CLI polish pass, partially
-verified against real hardware and real infrastructure. Building has
-continued through M7 with a real backup-and-restore-to-another-device test
-deliberately deferred until the whole stack exists — see `ROADMAP.md` for
-exactly what has and hasn't been exercised at each milestone.
+repo is at **M7** — protocol spike + verification gate + catalog + archive
+layer + restore + backup decryption + CLI polish + a Tauri desktop app,
+partially verified against real hardware and real infrastructure. A real
+backup-and-restore-to-another-device test — and eyes on the actual running
+UI — are deliberately deferred until now that the whole stack exists. See
+`ROADMAP.md` for exactly what has and hasn't been exercised at each
+milestone.
 
 ## Status
 
@@ -45,17 +46,27 @@ M1's verification gate now does the real `PRAGMA integrity_check` when a
 backup password has been stored (`cradle password set`); without one it
 still falls back to the reduced check from M1's original build.
 
+M7's desktop app builds, passes clippy, and launches — a real window opens
+and becomes key. Nothing past that has been visually confirmed: whether
+the device list populates, a live backup renders correctly, or the
+attention banner and history table actually work needs eyes on the
+running window, which this environment can't substitute for — see
+`ROADMAP.md`'s M7 section.
+
 ## Layout
 
 - `crates/cradle-core` — device discovery, prechecks, the `mobilebackup2`
   backup path, the post-backup verification gate, the catalog
   (`devices`/`runs`/`snapshots`/`destinations`/`archives` in SQLite), the
   restic-backed archive layer, Keychain access, restore (including
-  cross-device migration), and backup decryption. No UI yet (M7).
+  cross-device migration), and backup decryption.
 - `crates/cradle-cli` — the `cradle` binary: `cradle devices`,
   `cradle backup`, `cradle history`, `cradle destination add/list`,
   `cradle archive run/list/prune/check`, `cradle restore`,
   `cradle password set/forget`, `cradle decrypt`, `cradle completions`.
+- `crates/cradle-app` — the Tauri desktop app: device list, backup with
+  live progress, run history. Static HTML/CSS/JS frontend (`dist/`), no
+  npm build step.
 
 ## Building
 
@@ -69,6 +80,16 @@ cargo build
 
 On macOS, `usbmuxd` is part of the OS — nothing else to install. The
 archive layer needs `restic` on `PATH` (`brew install restic`).
+
+To run the desktop app:
+
+```sh
+cargo run -p cradle-app
+```
+
+No Node/npm needed to *run* it (the frontend in `crates/cradle-app/dist`
+is static HTML/CSS/JS); `npx @tauri-apps/cli` is only needed for
+packaging a distributable bundle later (M8).
 
 ## Usage
 
