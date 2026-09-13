@@ -11,14 +11,7 @@ aes = "0.9.3"
 aes-kw = "0.3.1"
 cbc = "0.2.1"
 dirs = "7.0.0"
-# Pinned exactly per CLAUDE.md: idevice ships breaking changes on every point
-# release before 0.2.0. Bumping this is a deliberate task with a full
-# re-test against a real device, not a routine dependency update.
-idevice = { version = "=0.1.65", default-features = true, features = [
-    "usbmuxd",
-    "mobilebackup2",
-    "notification_proxy",
-] }
+libc = "0.2"
 pbkdf2 = "0.13.0"
 plist = "1.8"
 rand = "0.10.2"
@@ -30,4 +23,5 @@ serde_json = "1.0.151"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "process", "rt", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "process", "rt", "time"] }
+tracing = "0.1"

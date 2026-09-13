@@ -194,6 +194,26 @@
       <div id="backup-result"></div>
     </section>
 
+    <section class="panel" id="encryption-panel" style="display:none;">
+      <h2>Set backup password — <span id="encryption-device-name"></span></h2>
+      <div class="status-line">
+        iOS has no Settings toggle for this — it's a computer-side setting sent directly to the
+        device. Turning it on here is required before a backup can start (Keychain, Health, call
+        history and saved passwords are otherwise silently omitted), and is unrelated to Finder,
+        which can get stuck behind its own "backup was corrupt" dialog. The password is stored in
+        the macOS Keychain, never shown again — write it down somewhere safe too.
+      </div>
+      <form id="encryption-form" style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; margin-top:10px;">
+        <div style="flex:1; min-width:200px;">
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">New backup password</label>
+          <input type="password" id="encryption-password" required autocomplete="new-password" style="font:inherit; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--text); width:100%;" />
+        </div>
+        <button type="submit" class="primary">Turn on encryption</button>
+      </form>
+      <div id="encryption-status" class="status-line"></div>
+      <div id="encryption-result"></div>
+    </section>
+
     <section class="panel" id="restore-panel" style="display:none;">
       <h2>Restore — <span id="restore-device-name"></span></h2>
       <div style="display:flex; gap:16px; align-items:flex-end; flex-wrap:wrap; margin-bottom:10px;">
@@ -348,6 +368,12 @@ function renderDevices(devices) {
     btn.disabled = !d.reachable;
     btn.onclick = () => startBackup(d);
     right.appendChild(btn);
+
+    const encryptionBtn = document.createElement("button");
+    encryptionBtn.textContent = "Set Backup Password";
+    encryptionBtn.disabled = !d.reachable;
+    encryptionBtn.onclick = () => openEncryptionPanel(d);
+    right.appendChild(encryptionBtn);
 
     const destSelect = document.createElement("select");
     destSelect.style.font = "inherit";
@@ -557,6 +583,42 @@ async function startArchive(device, destinationName) {
     document.getElementById("archive-status").textContent = "Failed.";
   }
 }
+
+let encryptionDevice = null;
+
+function openEncryptionPanel(device) {
+  encryptionDevice = device;
+  document.getElementById("encryption-panel").style.display = "block";
+  document.getElementById("encryption-device-name").textContent = device.name ?? device.udid;
+  document.getElementById("encryption-password").value = "";
+  document.getElementById("encryption-status").textContent = "";
+  document.getElementById("encryption-result").innerHTML = "";
+  document.getElementById("encryption-password").focus();
+}
+
+document.getElementById("encryption-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!encryptionDevice) return;
+  const password = document.getElementById("encryption-password").value;
+  const status = document.getElementById("encryption-status");
+  const result = document.getElementById("encryption-result");
+  const submitBtn = e.target.querySelector("button[type=submit]");
+  submitBtn.disabled = true;
+  status.textContent = "Sending to the device — check it for a prompt if this hangs…";
+  result.innerHTML = "";
+  try {
+    await invoke("enable_encryption", { udid: encryptionDevice.udid, password });
+    document.getElementById("encryption-password").value = "";
+    status.textContent = "Done.";
+    result.innerHTML = `<div class="result ok">Backup encryption is on. Password stored in the Keychain.</div>`;
+    refreshDevices();
+  } catch (err) {
+    status.textContent = "Failed.";
+    result.innerHTML = `<div class="result bad">${err}</div>`;
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
 
 function resetBackupUi(name) {
   document.getElementById("backup-panel").style.display = "block";
@@ -799,10 +861,13 @@ listen("restore-status", (event) => {
 
 listen("backup-retry", (event) => {
   const { reason, attempt, max } = event.payload;
+  const messages = {
+    host_io: `Host-side I/O error (usually low memory on this Mac) — retrying (attempt ${attempt}/${max})…`,
+    stalled: `Device stopped responding, no error reported — check the cable/USB connection. Retrying (attempt ${attempt}/${max})…`,
+    device_locked: `Device locked mid-backup — unlock it now. Retrying (attempt ${attempt}/${max})…`,
+  };
   document.getElementById("backup-status").textContent =
-    reason === "host_io"
-      ? `Host-side I/O error (usually low memory on this Mac) — retrying (attempt ${attempt}/${max})…`
-      : `Device locked mid-backup — unlock it now. Retrying (attempt ${attempt}/${max})…`;
+    messages[reason] ?? `Retrying (attempt ${attempt}/${max})…`;
 });
 
 document.getElementById("refresh").onclick = refreshDevices;

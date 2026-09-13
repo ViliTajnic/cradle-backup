@@ -56,11 +56,29 @@ iPhone ──mobilebackup2──▶ working/<UDID>/   (canonical, local, never m
 
 ## Stack
 
-- **Core:** Rust. Pure, no C dependencies, no LGPL obligations.
-- **Device protocol:** the `idevice` crate (MIT), pinned `=0.1.65`.
-  It ships breaking changes on every point release until 0.2.0 —
-  **never use a caret range.** Bumping the pin is a deliberate task with
-  a full re-test against a real device, not a routine dependency update.
+- **Core:** Rust.
+- **Device protocol:** `libimobiledevice`'s CLI tools (`idevicebackup2`,
+  `ideviceinfo`, `idevicepair`, `idevice_id`) as subprocesses — the same
+  footing as `restic`/`rclone` below, not a linked library. Install with
+  `brew install libimobiledevice`; Cradle also checks the usual Homebrew
+  prefixes if it isn't on `PATH`. **Not a Windows story yet** — no
+  first-party Windows build of these tools is tested; Windows support is
+  its own follow-up, unblocked by this.
+
+  This replaced the `idevice` Rust crate (pinned `=0.1.65`), which
+  reliably failed a real backup with `MBErrorDomain 104` at a fixed point
+  (~94%, ~19,000 files), reproducing regardless of working directory
+  history or destination volume — while `idevicebackup2`, run directly
+  against the same device with the same live data, completed cleanly.
+  That isolated the bug to the crate itself rather than the device, the
+  data, or the environment. If `idevice` ever gets a fix worth revisiting,
+  bumping back to it (or off `=0.1.65`) is the same kind of deliberate,
+  full-real-device-retest task switching to the CLI tools was — never a
+  routine dependency bump either way.
+
+  **Trade-off accepted going in:** the CLI tools' default output reports
+  files done/total, bytes, rate, and an overall percentage, but not each
+  file's *domain* — see "The extension seam" below.
 - **UI:** Tauri. One webview frontend for both platforms.
 - **Catalog:** SQLite via `rusqlite`.
 - **Archive:** `restic` (BSD-2) as a subprocess; `rclone` (MIT) for
@@ -75,20 +93,26 @@ would fight Apple's driver for the device claim).
 
 ## The extension seam
 
-`BackupDelegate` abstracts **all** filesystem I/O — `open_file_read`,
-`create_file_write`, `create_dir_all`, `list_dir`, `exists`, `remove`,
-`rename`, `copy` — plus `on_progress(bytes_done, bytes_total, overall)`
-and `on_file_received(path, count)`.
+`ProgressSink` (`on_progress`, `on_file`, `on_attention_needed`) is where
+honest progress lives — every backend (backup, restore, archive) feeds
+the same trait, and every UI (CLI, Tauri app) consumes it the same way.
+Finder shows an indeterminate barber-pole while moving 70+ GB; that
+failure is the reason this project exists. Every long-running operation
+reports files done/total, bytes, rate, and ETA. Never ship an
+indeterminate spinner for an operation whose progress we can measure.
 
-This trait is where "backup to anywhere" lives. Destinations are alternate
-delegate implementations, not a copy step bolted on afterwards. Design
-new storage support around this trait.
+**Current gap:** `idevicebackup2`'s default output doesn't name each
+file's *domain* the way a typed protocol callback could — parsing its
+`-d` debug output would get it back, but that's raw protocol frames,
+fragile and versioned to internals, not worth it unless a real need for
+per-file domain display shows up.
 
-It is also the source of honest progress. Finder shows an indeterminate
-barber-pole while moving 70+ GB; that failure is the reason this project
-exists. Every long-running operation reports files done/total, bytes,
-rate, ETA, and current domain. Never ship an indeterminate spinner for
-an operation whose progress we can measure.
+"Backup to anywhere" lives at the *archive* layer, not the backup step:
+`working/<UDID>/` is always local (device protocols never point at a
+network mount — see the architecture section above), and `restic`/
+`rclone` are what actually reach other destinations. A new destination is
+a new `restic`/`rclone`-backed target in `archive.rs`, not a new backup
+backend.
 
 ## Verification gate
 

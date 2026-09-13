@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod crypto;
 pub mod device;
 pub mod keychain;
+pub mod libimobiledevice;
 pub mod memory;
 pub mod notify;
 pub mod power;
@@ -24,22 +25,29 @@ pub mod precheck;
 pub mod restore;
 pub mod verify;
 
-/// Errors that can occur anywhere in the Cradle core: device protocol
-/// failures, local filesystem failures, or a handful of Cradle-specific
-/// conditions the `idevice` crate has no vocabulary for.
+/// Errors that can occur anywhere in the Cradle core: `libimobiledevice`
+/// CLI-tool failures, local filesystem failures, or a handful of
+/// Cradle-specific conditions.
 #[derive(Debug, thiserror::Error)]
 pub enum CradleError {
-    #[error("device error: {0}")]
-    Device(#[from] idevice::IdeviceError),
-
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("device did not report a UDID")]
-    MissingUdid,
-
     #[error("catalog error: {0}")]
     Catalog(#[from] rusqlite::Error),
+
+    /// A `libimobiledevice` CLI tool (`idevice_id`, `ideviceinfo`,
+    /// `idevicepair`, `idevicebackup2`) isn't on `PATH` or in one of the
+    /// usual Homebrew prefixes.
+    #[error("`{0}` not found — install libimobiledevice with `brew install libimobiledevice`")]
+    ToolNotFound(&'static str),
+
+    /// A `libimobiledevice` CLI tool exited non-zero or printed an error of
+    /// its own. These tools already name the fix in plain English (e.g.
+    /// "No device found with udid ...", "tap Trust"), so this is usually
+    /// shown to the user as-is rather than re-translated.
+    #[error("{0}")]
+    ToolFailed(String),
 
     /// MBErrorDomain 208. Split out from [`Self::Other`] because it's
     /// recoverable: see [`backup::run_resilient`], which retries on this
@@ -73,6 +81,20 @@ pub enum CradleError {
          keeps happening"
     )]
     HostIoError,
+
+    /// The device stopped responding mid-attempt with no final `ErrorCode`
+    /// and no transport error — just silence. Split out from [`Self::Other`]
+    /// for the same reason as [`Self::DeviceLocked`]/[`Self::HostIoError`]:
+    /// [`backup::run_resilient`] retries on it. Found necessary after a real
+    /// run where an attempt hung indefinitely with no error at all —
+    /// `backup_from_path` has no timeout of its own, so without a watchdog
+    /// this could (and did) sit forever with no visible failure.
+    #[error(
+        "the device stopped responding mid-backup with no error and no further progress — \
+         Cradle will retry automatically, but check the cable/USB connection and that the \
+         device is unlocked and awake if it keeps happening"
+    )]
+    Stalled,
 
     #[error("{0}")]
     Other(String),

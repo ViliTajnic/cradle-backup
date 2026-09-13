@@ -105,17 +105,18 @@ enum Command {
         #[arg(long)]
         no_reboot: bool,
         /// Also restore system files (off by default, matching
-        /// `idevice`'s own `RestoreOptions` default).
+        /// `idevicebackup2 restore`'s own default).
         #[arg(long)]
         system_files: bool,
     },
-    /// Manage a device's backup password in the macOS Keychain.
+    /// Manage a device's backup encryption password.
     ///
-    /// Storing it unlocks the real `Manifest.db` integrity check on
+    /// `set`/`forget` only manage the copy stored in the macOS Keychain —
+    /// storing it unlocks the real `Manifest.db` integrity check on
     /// `cradle backup` (see `verify.rs`) instead of the reduced one, and
-    /// is needed for `cradle decrypt`. This is the password set on the
-    /// *device* (Settings/Finder's "Encrypted Backup") — Cradle never
-    /// generates or changes it.
+    /// is needed for `cradle decrypt`. `enable` actually turns encryption
+    /// on on the device itself, over the wire — see its own doc for why
+    /// that's needed at all.
     Password {
         #[command(subcommand)]
         command: PasswordCommand,
@@ -171,6 +172,27 @@ enum PasswordCommand {
         /// Device UDID.
         #[arg(long)]
         udid: String,
+    },
+    /// Turns on backup encryption on the device itself, over the wire.
+    ///
+    /// iOS has no Settings toggle for this — it's purely a computer-side
+    /// setting the device stores, normally set via Finder's "Encrypt local
+    /// backup" checkbox. Use this instead when Finder's own local-backup
+    /// bookkeeping is stuck (e.g. a "backup was corrupt" dialog blocking
+    /// that checkbox). Also stores the password in the Keychain on
+    /// success, same as `password set`.
+    Enable {
+        /// Device UDID. Required when more than one device is attached.
+        #[arg(long)]
+        udid: Option<String>,
+        /// The new backup password. Prefer the hidden prompt (omit this)
+        /// — see `password set`'s doc for why.
+        #[arg(long)]
+        password: Option<String>,
+        /// Scratch directory the protocol call needs to be pointed at.
+        /// No backup files are written here for this operation.
+        #[arg(long, default_value = "working")]
+        working_dir: PathBuf,
     },
 }
 
@@ -322,7 +344,7 @@ async fn run_command(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
-        Command::Password { command } => run_password(command),
+        Command::Password { command } => run_password(command).await,
         Command::Decrypt {
             udid,
             working_dir,
@@ -353,11 +375,7 @@ async fn run_devices() -> anyhow::Result<()> {
 }
 
 async fn describe(udid: &str) -> anyhow::Result<String> {
-    let provider = device::provider_for(udid).await?;
-    let mut lockdown = device::lockdown_session(&*provider)
-        .await
-        .map_err(|_| anyhow::anyhow!("pairing record invalid — unlock the device and tap Trust"))?;
-    let info = device::info(&mut lockdown).await?;
+    let info = device::info(udid).await?;
     Ok(format!(
         "{} ({}, iOS {})",
         info.name, info.product_type, info.ios_version
@@ -389,10 +407,9 @@ async fn run_backup(
     let _sleep_guard = SleepGuard::engage();
 
     let udid = resolve_udid(udid).await?;
-    let provider = device::provider_for(&udid).await?;
 
     println!("Running prechecks...");
-    let precheck_report = precheck::run(&*provider, &working_root).await?;
+    let precheck_report = precheck::run(&udid, &working_root).await?;
 
     if let Some(info) = &precheck_report.device {
         println!(
@@ -408,10 +425,14 @@ async fn run_backup(
     }
     if !precheck_report.encryption_enabled {
         anyhow::bail!(
-            "Backup encryption is off on this device. Enable it under Settings > General > \
-             Transfer or Reset iPhone > Encrypted Backup (or via Finder) before continuing — \
-             without it, Keychain, Health, call history and saved passwords are silently \
-             omitted from the backup."
+            "Backup encryption is off on this device. Run `cradle password enable --udid {}` \
+             to turn it on before continuing — without it, Keychain, Health, call history and \
+             saved passwords are silently omitted from the backup.",
+            precheck_report
+                .device
+                .as_ref()
+                .map(|d| d.udid.as_str())
+                .unwrap_or("<udid>")
         );
     }
     if !precheck_report.free_space_ok {
@@ -421,17 +442,6 @@ async fn run_backup(
             human_bytes(precheck::MIN_FREE_BYTES),
         );
     }
-    if !precheck_report.free_memory_ok {
-        anyhow::bail!(
-            "Only {} of free memory on this Mac; want at least {} before starting a backup — a \
-             multi-hour transfer with this little headroom risks a real host-side I/O error \
-             partway through (device error 104), not just a slow one. Close some apps or \
-             browser tabs and try again.",
-            human_bytes(precheck_report.free_memory_bytes.unwrap_or(0)),
-            human_bytes(precheck::MIN_FREE_MEMORY_BYTES),
-        );
-    }
-
     let device_info = precheck_report.device.clone().ok_or_else(|| {
         anyhow::anyhow!("prechecks passed but returned no device info — this is a bug")
     })?;
@@ -458,7 +468,7 @@ async fn run_backup(
     // avoid.
     let attempt: Result<(backup::Outcome, verify::Report), (CradleError, u64, u64)> = async {
         let outcome = backup::run_resilient(
-            &*provider,
+            &udid,
             &working_root,
             full,
             progress.clone(),
@@ -473,6 +483,14 @@ async fn run_backup(
                     "\nHost-side I/O error (device error 104) — usually low memory on this Mac. \
                      Retrying in {}s (attempt {}/{})...",
                     backup::HOST_IO_RETRY_DELAY.as_secs(),
+                    attempt,
+                    max_attempts
+                ),
+                backup::RetryReason::Stalled => eprintln!(
+                    "\nDevice stopped responding, no error reported — check the cable/USB \
+                     connection and that the device is unlocked and awake. Retrying in {}s \
+                     (attempt {}/{})...",
+                    backup::STALL_RETRY_DELAY.as_secs(),
                     attempt,
                     max_attempts
                 ),
@@ -579,8 +597,8 @@ fn gate_problems(gate: &verify::Report) -> Vec<String> {
     }
     if !gate.file_count_match {
         problems.push(format!(
-            "File count mismatch: {} files on disk vs. {} the device reported sending.",
-            gate.files_on_disk, gate.files_reported
+            "File count mismatch: {} files on disk vs. {} expected.",
+            gate.files_on_disk, gate.files_expected
         ));
     }
     problems
@@ -889,7 +907,6 @@ async fn run_restore(
 
     let udid = resolve_udid(udid).await?;
     let source_udid = source_udid.unwrap_or_else(|| udid.clone());
-    let provider = device::provider_for(&udid).await?;
     let catalog = Catalog::open(&catalog_path)?;
 
     println!("Staging backup for restore...");
@@ -912,7 +929,7 @@ async fn run_restore(
     let backup_ios = restore::backup_ios_version(&staged_dir)?;
 
     println!("Running restore prechecks...");
-    let report = precheck::run_restore(&*provider, &backup_ios).await?;
+    let report = precheck::run_restore(&udid, &backup_ios).await?;
 
     if let Some(info) = &report.device {
         println!(
@@ -947,12 +964,22 @@ async fn run_restore(
         system_files,
     };
 
+    let stored_password = keychain::try_read(&keychain::device_account(&source_udid))?;
+
     println!(
         "Restoring {} (source {source_udid}) onto target {udid}...",
         staged_dir.display()
     );
     let progress = Arc::new(TerminalProgress::new());
-    let result = restore::run(&*provider, &staged_dir, &source_udid, &config, progress.clone()).await;
+    let result = restore::run(
+        &udid,
+        &staged_dir,
+        &source_udid,
+        &config,
+        stored_password.as_deref(),
+        progress.clone(),
+    )
+    .await;
     progress.finish();
 
     match result {
@@ -976,7 +1003,7 @@ async fn run_restore(
     }
 }
 
-fn run_password(command: PasswordCommand) -> anyhow::Result<()> {
+async fn run_password(command: PasswordCommand) -> anyhow::Result<()> {
     match command {
         PasswordCommand::Set { udid, password } => {
             let password = match password {
@@ -993,6 +1020,27 @@ fn run_password(command: PasswordCommand) -> anyhow::Result<()> {
         PasswordCommand::Forget { udid } => {
             keychain::delete(&keychain::device_account(&udid))?;
             println!("Removed the stored backup password for {udid}.");
+            Ok(())
+        }
+        PasswordCommand::Enable {
+            udid,
+            password,
+            working_dir,
+        } => {
+            let udid = resolve_udid(udid).await?;
+            let password = match password {
+                Some(p) => p,
+                None => rpassword::prompt_password("New backup password: ")?,
+            };
+            if password.is_empty() {
+                anyhow::bail!("Password was empty — not enabling encryption.");
+            }
+            println!("Sending ChangePassword to the device — check it for a prompt if this hangs...");
+            backup::set_encryption(&udid, &working_dir, None, Some(&password)).await?;
+            keychain::store(&keychain::device_account(&udid), &password)?;
+            println!(
+                "Backup encryption is now on for {udid}. Password stored in the Keychain."
+            );
             Ok(())
         }
     }

@@ -110,22 +110,13 @@ pub async fn list_devices() -> Result<Vec<DeviceEntry>, String> {
             pairing_message: None,
         };
 
-        match device::provider_for(&a.udid).await {
-            Ok(provider) => match device::lockdown_session(&*provider).await {
-                Ok(mut lockdown) => match device::info(&mut lockdown).await {
-                    Ok(info) => {
-                        entry.name = Some(info.name);
-                        entry.product_type = Some(info.product_type);
-                        entry.ios_version = Some(info.ios_version);
-                        entry.reachable = true;
-                    }
-                    Err(e) => entry.pairing_message = Some(e.to_string()),
-                },
-                Err(_) => {
-                    entry.pairing_message =
-                        Some("Pairing record invalid — unlock the device and tap Trust.".to_string());
-                }
-            },
+        match device::info(&a.udid).await {
+            Ok(info) => {
+                entry.name = Some(info.name);
+                entry.product_type = Some(info.product_type);
+                entry.ios_version = Some(info.ios_version);
+                entry.reachable = true;
+            }
             Err(e) => entry.pairing_message = Some(e.to_string()),
         }
 
@@ -133,6 +124,28 @@ pub async fn list_devices() -> Result<Vec<DeviceEntry>, String> {
     }
 
     Ok(out)
+}
+
+/// Turns on backup encryption on the device itself, over the wire, and
+/// stores the new password in the Keychain — mirrors `cradle password
+/// enable`. iOS has no on-device Settings toggle for this: it's purely a
+/// computer-side setting normally set via Finder's "Encrypt local backup"
+/// checkbox, which Finder's own local-backup bookkeeping can wedge behind
+/// a "backup was corrupt" dialog with no way through. This exists so a
+/// user is never sent to fight with Finder for a setting that lives
+/// entirely on the wire — the password is typed here, in this panel,
+/// never in a terminal or shell history.
+#[tauri::command]
+pub async fn enable_encryption(udid: String, password: String) -> Result<(), String> {
+    if password.is_empty() {
+        return Err("Password was empty — not enabling encryption.".to_string());
+    }
+    let working_root = default_working_dir();
+    backup::set_encryption(&udid, &working_root, None, Some(&password))
+        .await
+        .map_err(|e| e.to_string())?;
+    keychain::store(&keychain::device_account(&udid), &password).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[derive(Serialize, Clone)]
@@ -161,10 +174,9 @@ pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String
 
     let working_root = resolve_working_dir(working_dir);
     let catalog = open_catalog()?;
-    let provider = device::provider_for(&udid).await.map_err(|e| e.to_string())?;
 
     let _ = app.emit("backup-status", "Running prechecks...");
-    let precheck_report = precheck::run(&*provider, &working_root)
+    let precheck_report = precheck::run(&udid, &working_root)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -175,10 +187,9 @@ pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String
     }
     if !precheck_report.encryption_enabled {
         return Err(
-            "Backup encryption is off on this device. Enable it under Settings > General > \
-             Transfer or Reset iPhone > Encrypted Backup (or via Finder) before continuing — \
-             without it, Keychain, Health, call history and saved passwords are silently \
-             omitted from the backup."
+            "Backup encryption is off on this device. Use the \"Set backup password\" panel to \
+             turn it on before continuing — without it, Keychain, Health, call history and \
+             saved passwords are silently omitted from the backup."
                 .to_string(),
         );
     }
@@ -190,17 +201,6 @@ pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String
             precheck::MIN_FREE_BYTES,
         ));
     }
-    if !precheck_report.free_memory_ok {
-        return Err(format!(
-            "Only {} bytes of free memory on this Mac; want at least {} bytes before starting a \
-             backup — a multi-hour transfer with this little headroom risks a real host-side \
-             I/O error partway through (device error 104), not just a slow one. Close some apps \
-             or browser tabs and try again.",
-            precheck_report.free_memory_bytes.unwrap_or(0),
-            precheck::MIN_FREE_MEMORY_BYTES,
-        ));
-    }
-
     let device_info = precheck_report
         .device
         .clone()
@@ -221,10 +221,11 @@ pub async fn run_backup(app: AppHandle, udid: String, working_dir: Option<String
 
     let progress = Arc::new(TauriProgress::for_backup(app.clone()));
     let retry_app = app.clone();
-    let attempt = backup::run_resilient(&*provider, &working_root, false, progress, move |reason, attempt, max| {
+    let attempt = backup::run_resilient(&udid, &working_root, false, progress, move |reason, attempt, max| {
         let reason_str = match reason {
             backup::RetryReason::DeviceLocked => "device_locked",
             backup::RetryReason::HostIo => "host_io",
+            backup::RetryReason::Stalled => "stalled",
         };
         let _ = retry_app.emit(
             "backup-retry",
@@ -340,8 +341,8 @@ fn gate_problems(gate: &verify::Report) -> Vec<String> {
     }
     if !gate.file_count_match {
         problems.push(format!(
-            "File count mismatch: {} files on disk vs. {} the device reported sending.",
-            gate.files_on_disk, gate.files_reported
+            "File count mismatch: {} files on disk vs. {} expected.",
+            gate.files_on_disk, gate.files_expected
         ));
     }
     problems
@@ -603,7 +604,6 @@ pub async fn run_restore(
     let working_root = resolve_working_dir(working_dir);
     let scratch_root = resolve_scratch_dir(scratch_dir);
     let catalog = open_catalog()?;
-    let provider = device::provider_for(&udid).await.map_err(|e| e.to_string())?;
 
     let _ = app.emit("restore-status", "Staging backup for restore...");
     let staged_dir = restore::stage_from_working(&working_root, &source_udid, &scratch_root)
@@ -613,7 +613,7 @@ pub async fn run_restore(
     let backup_ios = restore::backup_ios_version(&staged_dir).map_err(|e| e.to_string())?;
 
     let _ = app.emit("restore-status", "Running restore prechecks...");
-    let report = precheck::run_restore(&*provider, &backup_ios)
+    let report = precheck::run_restore(&udid, &backup_ios)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -643,9 +643,11 @@ pub async fn run_restore(
         .map_err(|e| e.to_string())?;
 
     let config = restore::RestoreConfig { reboot, system_files };
+    let stored_password =
+        keychain::try_read(&keychain::device_account(&source_udid)).map_err(|e| e.to_string())?;
     let progress = Arc::new(TauriProgress::for_restore(app.clone()));
     let _ = app.emit("restore-status", "Restoring...");
-    let result = restore::run(&*provider, &staged_dir, &source_udid, &config, progress).await;
+    let result = restore::run(&udid, &staged_dir, &source_udid, &config, stored_password.as_deref(), progress).await;
 
     match result {
         Ok(outcome) => {

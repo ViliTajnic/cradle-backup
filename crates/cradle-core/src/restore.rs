@@ -10,18 +10,17 @@
 //! the working set." [`stage_from_working`] only ever *reads* from
 //! `working/<UDID>/`; [`run`] only ever touches the scratch directory it's
 //! given, never the working set.
+//!
+//! The restore protocol itself is driven by `idevicebackup2 restore` (see
+//! [`crate::libimobiledevice`]) as a subprocess — see `backup.rs`'s module
+//! doc for why this replaced the `idevice` Rust crate.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use idevice::{
-    IdeviceService,
-    mobilebackup2::{MobileBackup2Client, RestoreOptions},
-    provider::IdeviceProvider,
-};
-
 use crate::CradleError;
-use crate::backup::{FsProgressDelegate, ProgressSink};
+use crate::backup::ProgressSink;
+use crate::libimobiledevice;
 
 /// Copies `working_root.join(source_udid)` into `scratch_dir`, leaving the
 /// source untouched — the "backup is still on this machine" path, no
@@ -78,10 +77,10 @@ pub fn backup_ios_version(staged_dir: &Path) -> Result<String, CradleError> {
 }
 
 /// Restore configuration — a thin, Cradle-flavored subset of
-/// `idevice::mobilebackup2::RestoreOptions`. Deliberately not everything
-/// that type exposes: CLAUDE.md is explicit that selective restore isn't
-/// happening, and the remaining flags there don't have a meaningful
-/// default worth exposing yet.
+/// `idevicebackup2 restore`'s own flags. Deliberately not everything that
+/// tool exposes: CLAUDE.md is explicit that selective restore isn't
+/// happening, and the remaining flags don't have a meaningful default
+/// worth exposing yet.
 #[derive(Debug, Clone)]
 pub struct RestoreConfig {
     pub reboot: bool,
@@ -103,10 +102,10 @@ pub struct Outcome {
     pub target_udid: String,
 }
 
-/// Runs the MobileBackup2 restore protocol against `provider` (the
-/// *target* device), reading from `staged_dir` — already staged in a
-/// scratch directory by [`stage_from_working`] or `archive::restore`,
-/// never `working/<UDID>/` directly.
+/// Runs the MobileBackup2 restore protocol against the device identified by
+/// `target_udid`, reading from `staged_dir` — already staged in a scratch
+/// directory by [`stage_from_working`] or `archive::restore`, never
+/// `working/<UDID>/` directly.
 ///
 /// `source_udid` is the UDID the backup was originally taken from, which
 /// may differ from the target device's own UDID — that's cross-device
@@ -115,11 +114,20 @@ pub struct Outcome {
 /// root passed to the protocol, since it expects `backup_root/<source_udid>/`
 /// to exist underneath it — the same convention [`crate::backup::run`]
 /// writes into, which both staging functions preserve.
+///
+/// `password`, if the backup is encrypted, is the *source* backup's own
+/// password (the one `cradle password set`/`enable` stored for
+/// `source_udid`) — `idevicebackup2 restore` needs it to decrypt files as
+/// it writes them, and refuses outright ("a backup password is required
+/// to restore an encrypted backup") without it. Passed via the
+/// `BACKUP_PASSWORD` environment variable, never a CLI argument, so it
+/// never shows up in `ps` or shell history.
 pub async fn run(
-    provider: &dyn IdeviceProvider,
+    target_udid: &str,
     staged_dir: &Path,
     source_udid: &str,
     config: &RestoreConfig,
+    password: Option<&str>,
     progress: Arc<dyn ProgressSink>,
 ) -> Result<Outcome, CradleError> {
     let backup_root = staged_dir.parent().ok_or_else(|| {
@@ -128,33 +136,26 @@ pub async fn run(
             staged_dir.display()
         ))
     })?;
+    let dir = backup_root
+        .to_str()
+        .ok_or_else(|| CradleError::Other(format!("backup root {} is not valid UTF-8", backup_root.display())))?;
 
-    let mut client = MobileBackup2Client::connect(provider).await?;
-    let target_udid = client
-        .idevice
-        .udid()
-        .map(|s| s.to_string())
-        .ok_or(CradleError::MissingUdid)?;
-
-    let options = RestoreOptions::new()
-        .with_reboot(config.reboot)
-        .with_system_files(config.system_files);
-
-    let delegate = FsProgressDelegate::new(progress);
-    let response = client
-        .restore_from_path(backup_root, Some(source_udid), Some(options), &delegate)
-        .await?;
-
-    if let Some(dict) = &response
-        && let Some(code) = dict.get("ErrorCode")
-        && code.as_signed_integer() != Some(0)
-    {
-        return Err(CradleError::Other(format!(
-            "device reported a restore error: {code:?}"
-        )));
+    let mut args = vec!["-u", target_udid, "-s", source_udid, "restore"];
+    if config.system_files {
+        args.push("--system");
     }
+    if !config.reboot {
+        args.push("--no-reboot");
+    }
+    args.push(dir);
 
-    Ok(Outcome { target_udid })
+    let env: Vec<(&str, &str)> = password.map(|p| ("BACKUP_PASSWORD", p)).into_iter().collect();
+    let result = libimobiledevice::run_idevicebackup2(&args, &env, progress).await;
+    result.outcome?;
+
+    Ok(Outcome {
+        target_udid: target_udid.to_string(),
+    })
 }
 
 #[cfg(test)]

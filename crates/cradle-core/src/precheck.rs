@@ -6,14 +6,9 @@
 
 use std::path::Path;
 
-use idevice::{
-    IdeviceError,
-    mobilebackup2::{BackupDelegate, FsBackupDelegate},
-    provider::IdeviceProvider,
-};
-
 use crate::CradleError;
 use crate::device::{self, DeviceInfo};
+use crate::libimobiledevice;
 
 /// Conservative floor for "enough free space to safely start a backup".
 ///
@@ -25,13 +20,53 @@ use crate::device::{self, DeviceInfo};
 /// once the catalog exists (M2/M3).
 pub const MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Conservative floor for "enough free memory to survive a multi-hour
-/// backup without a host-side I/O error" (MBErrorDomain 104). Confirmed
-/// against a real device — see [`crate::memory`]'s module doc — that this
-/// error hit repeatedly, every time free memory was under ~150MB. 1 GiB
-/// gives real headroom above that observed failure point without being an
-/// unreasonable bar on a modern Mac.
+/// Floor [`backup::wait_for_host_io_retry`] uses to decide whether it's
+/// still worth extending a host-I/O retry wait. Not a precheck gate: an
+/// earlier version of this file blocked backup start below this floor on
+/// the theory that low free memory reliably causes MBErrorDomain 104,
+/// based on a single incident. It doesn't — real runs since have hit the
+/// same 104 with memory well above this floor, timed to the device's own
+/// passcode/Face ID prompt instead (see `backup.rs`'s auth-prompt log
+/// lines). Gating backup *start* on a noisy, unconfirmed signal (see
+/// [`crate::memory`]'s module doc on why raw "Pages free" swings wildly)
+/// blocked legitimate backups for no real benefit, so it no longer does.
+///
+/// [`backup::wait_for_host_io_retry`]: crate::backup::wait_for_host_io_retry
 pub const MIN_FREE_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Free space in bytes available on the volume backing `path`, walking up
+/// to the nearest existing ancestor. Host-side only — no device
+/// involved — so this stays a plain `statfs` call rather than going
+/// through `libimobiledevice`. Reports a large constant where the OS can't
+/// be queried (e.g. no existing ancestor at all).
+#[allow(clippy::unnecessary_cast)] // block-count/size widths vary per platform
+fn free_disk_space(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+
+    const ASSUMED_FREE: u64 = 1 << 50;
+
+    let mut dir = path;
+    loop {
+        if dir.exists() {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return ASSUMED_FREE,
+        }
+    }
+
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return ASSUMED_FREE;
+    };
+    let mut s = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c` is NUL-terminated; `s` is a writable buffer for `statfs`.
+    if unsafe { libc::statfs(c.as_ptr(), s.as_mut_ptr()) } != 0 {
+        return ASSUMED_FREE;
+    }
+    let s = unsafe { s.assume_init() };
+    s.f_bavail as u64 * s.f_bsize as u64
+}
 
 /// Result of running all M0 prechecks against one device.
 #[derive(Debug, Clone)]
@@ -41,79 +76,53 @@ pub struct Report {
     pub encryption_enabled: bool,
     pub free_space_bytes: u64,
     pub free_space_ok: bool,
-    /// `None` when free memory couldn't be measured (non-macOS, or
-    /// `vm_stat` unavailable) — [`Self::free_memory_ok`] treats that as
-    /// passing rather than blocking on an unmeasurable condition.
+    /// Informational only — not gated on. See [`MIN_FREE_MEMORY_BYTES`]'s
+    /// doc for why a low reading here no longer blocks a backup from
+    /// starting. `None` when free memory couldn't be measured (non-macOS,
+    /// or `vm_stat` unavailable).
     pub free_memory_bytes: Option<u64>,
-    pub free_memory_ok: bool,
     pub device: Option<DeviceInfo>,
 }
 
 impl Report {
     /// `true` only if every check passed. A backup must not start otherwise.
     pub fn passed(&self) -> bool {
-        self.pairing_valid && self.encryption_enabled && self.free_space_ok && self.free_memory_ok
+        self.pairing_valid && self.encryption_enabled && self.free_space_ok
     }
 }
 
-/// Runs every M0 precheck against `provider`, evaluating free space on the
+/// Runs every M0 precheck against `udid`, evaluating free space on the
 /// volume backing `working_dir` and free memory on this Mac.
-pub async fn run(provider: &dyn IdeviceProvider, working_dir: &Path) -> Result<Report, CradleError> {
-    let free_space_bytes = FsBackupDelegate.get_free_disk_space(working_dir);
+pub async fn run(udid: &str, working_dir: &Path) -> Result<Report, CradleError> {
+    let free_space_bytes = free_disk_space(working_dir);
     let free_space_ok = free_space_bytes >= MIN_FREE_BYTES;
     let free_memory_bytes = crate::memory::free_bytes();
-    let free_memory_ok = free_memory_bytes
-        .map(|bytes| bytes >= MIN_FREE_MEMORY_BYTES)
-        .unwrap_or(true);
 
-    match device::lockdown_session(provider).await {
-        Ok(mut lockdown) => {
-            let device = device::info(&mut lockdown).await.ok();
-            let encryption_enabled = lockdown
-                .get_value(Some("WillEncrypt"), Some("com.apple.mobile.backup"))
-                .await
-                .ok()
-                .and_then(|v| v.as_boolean())
-                .unwrap_or(false);
-
-            Ok(Report {
-                pairing_valid: true,
-                pairing_message: None,
-                encryption_enabled,
-                free_space_bytes,
-                free_space_ok,
-                free_memory_bytes,
-                free_memory_ok,
-                device,
-            })
-        }
-        Err(e) => Ok(Report {
+    let pairing = libimobiledevice::check_pairing(udid).await?;
+    if !pairing.valid {
+        return Ok(Report {
             pairing_valid: false,
-            pairing_message: Some(pairing_error_message(&e)),
+            pairing_message: pairing.message,
             encryption_enabled: false,
             free_space_bytes,
             free_space_ok,
             free_memory_bytes,
-            free_memory_ok,
             device: None,
-        }),
+        });
     }
-}
 
-/// Translates a lockdown failure into the fix, not the symptom — per
-/// CLAUDE.md's error-message rule.
-fn pairing_error_message(e: &IdeviceError) -> String {
-    match e {
-        IdeviceError::InvalidHostID => {
-            "No pairing record for this device — open it once with Finder or Xcode, unlock the \
-             device, and tap Trust."
-                .to_string()
-        }
-        IdeviceError::SessionInactive => {
-            "Pairing record is stale — unlock the device and tap Trust when prompted.".to_string()
-        }
-        other => format!("Pairing check failed: {other}"),
-    }
+    let device = device::info(udid).await.ok();
+    let encryption_enabled = libimobiledevice::will_encrypt(udid).await;
+
+    Ok(Report {
+        pairing_valid: true,
+        pairing_message: None,
+        encryption_enabled,
+        free_space_bytes,
+        free_space_ok,
+        free_memory_bytes,
+        device,
+    })
 }
 
 /// Result of running the restore-only prechecks against the *target*
@@ -140,58 +149,40 @@ impl RestoreReport {
     }
 }
 
-/// Runs the restore-only prechecks against `provider` (the *target*
-/// device restore will write to), comparing its iOS version against
+/// Runs the restore-only prechecks against `udid` (the *target* device
+/// restore will write to), comparing its iOS version against
 /// `backup_ios_version` (read by the caller from the backup's own
 /// `Info.plist` — see `restore.rs`).
-pub async fn run_restore(
-    provider: &dyn IdeviceProvider,
-    backup_ios_version: &str,
-) -> Result<RestoreReport, CradleError> {
-    match device::lockdown_session(provider).await {
-        Ok(mut lockdown) => {
-            let device = device::info(&mut lockdown).await.ok();
-
-            // Domain isn't in lockdownd's enumerable set but answers
-            // GetValue queries anyway — same pattern as WillEncrypt above.
-            // Confirmed against real-world usage reports (there is no
-            // official Apple documentation for this domain): `IsAssociated`
-            // is `true` when Find My is linked to an Apple ID on the
-            // device. Defaults to the *stricter* assumption (associated)
-            // if the query fails, since the failure mode of a false "off"
-            // here is a bricked restore attempt on a Find My-locked device.
-            let find_my_associated = lockdown
-                .get_value(Some("IsAssociated"), Some("com.apple.fmip"))
-                .await
-                .ok()
-                .and_then(|v| v.as_boolean())
-                .unwrap_or(true);
-
-            let target_ios_version = device.as_ref().map(|d| d.ios_version.clone());
-            let target_ios_ok = target_ios_version
-                .as_deref()
-                .is_some_and(|target| ios_version_at_least(target, backup_ios_version));
-
-            Ok(RestoreReport {
-                pairing_valid: true,
-                pairing_message: None,
-                find_my_disabled: !find_my_associated,
-                target_ios_version,
-                backup_ios_version: backup_ios_version.to_string(),
-                target_ios_ok,
-                device,
-            })
-        }
-        Err(e) => Ok(RestoreReport {
+pub async fn run_restore(udid: &str, backup_ios_version: &str) -> Result<RestoreReport, CradleError> {
+    let pairing = libimobiledevice::check_pairing(udid).await?;
+    if !pairing.valid {
+        return Ok(RestoreReport {
             pairing_valid: false,
-            pairing_message: Some(pairing_error_message(&e)),
+            pairing_message: pairing.message,
             find_my_disabled: false,
             target_ios_version: None,
             backup_ios_version: backup_ios_version.to_string(),
             target_ios_ok: false,
             device: None,
-        }),
+        });
     }
+
+    let device = device::info(udid).await.ok();
+    let find_my_associated = libimobiledevice::find_my_associated(udid).await;
+    let target_ios_version = device.as_ref().map(|d| d.ios_version.clone());
+    let target_ios_ok = target_ios_version
+        .as_deref()
+        .is_some_and(|target| ios_version_at_least(target, backup_ios_version));
+
+    Ok(RestoreReport {
+        pairing_valid: true,
+        pairing_message: None,
+        find_my_disabled: !find_my_associated,
+        target_ios_version,
+        backup_ios_version: backup_ios_version.to_string(),
+        target_ios_ok,
+        device,
+    })
 }
 
 /// Dotted-version comparison (`"26.6.1" >= "26.6"`), not string comparison

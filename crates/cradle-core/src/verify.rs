@@ -19,10 +19,14 @@
 //! an interactive prompt into the middle of a backup run — callers decide
 //! whether to look one up first (see `keychain::try_read`).
 //!
-//! Check 3 is still reduced-scope: on-disk file count against what the
-//! delegate was told to expect, not a `SELECT COUNT(*) FROM Files` against
-//! the manifest. Nothing blocks that upgrade now that `Manifest.db` is
-//! readable — it just isn't built yet.
+//! Check 3 is still reduced-scope: on-disk file count against what
+//! `idevicebackup2` reported receiving, not a `SELECT COUNT(*) FROM Files`
+//! against the manifest. Nothing blocks that upgrade now that
+//! `Manifest.db` is readable — it just isn't built yet. It's also not
+//! exact equality (see [`file_count_matches`]): confirmed against a real
+//! device that "files received" can run a little ahead of distinct files
+//! on disk, since MobileBackup2's storage is content-addressed and
+//! identical-content files collapse into one on-disk file.
 
 use std::path::Path;
 
@@ -42,6 +46,13 @@ pub struct Report {
     pub manifest_integrity_checked: bool,
     pub files_on_disk: u64,
     pub files_reported: u64,
+    /// What `files_on_disk` was actually checked against — the manifest's
+    /// own `Files` count when the manifest could be read (accurate for
+    /// both full and incremental runs), otherwise `files_reported` (only
+    /// accurate for a full run). Distinct from `files_reported` so a
+    /// mismatch message can name the number that was actually compared,
+    /// not always the transfer count.
+    pub files_expected: u64,
     pub file_count_match: bool,
     /// Total bytes of every file under `backup_dir`, from the same walk
     /// that produced `files_on_disk`. This is the on-disk size of the
@@ -84,10 +95,29 @@ fn run_blocking(
 ) -> Result<Report, CradleError> {
     let status_finished = status_finished(backup_dir);
     let encrypted = backup_is_encrypted(backup_dir);
-    let (manifest_present, manifest_integrity_checked) =
+    let (manifest_present, manifest_integrity_checked, manifest_file_count) =
         manifest_db_ok(backup_dir, encrypted, password);
     let (files_on_disk, total_bytes) = scan_backup_dir(backup_dir)?;
-    let file_count_match = files_on_disk == files_reported;
+    // Prefer the manifest's own file count when it's available (it always
+    // reflects the *whole current snapshot*, full or incremental) over
+    // `files_reported` (only what this run itself transferred — correct
+    // for a full backup, meaningless for an incremental one, which by
+    // design only sends changed files). Found necessary on a real
+    // incremental run: 52 files transferred, 20,388 in the snapshot on
+    // disk — comparing disk count against the transfer count alone can
+    // never work for anything but a full backup.
+    //
+    // The manifest's `Files` table only tracks the device's own backed-up
+    // content — not `idevicebackup2`'s own local bookkeeping files, which
+    // `scan_backup_dir`'s disk walk does count since they're real regular
+    // files sitting right there at the backup root. Confirmed against a
+    // real, completely fresh single-shot backup: disk count ran exactly
+    // `BACKUP_METADATA_FILES.len()` ahead of the manifest count, every
+    // time, with nothing else going on.
+    let files_expected = manifest_file_count
+        .map(|n| n + count_present(backup_dir, &BACKUP_METADATA_FILES))
+        .unwrap_or(files_reported);
+    let file_count_match = file_count_matches(files_on_disk, files_expected);
 
     Ok(Report {
         status_finished,
@@ -95,9 +125,41 @@ fn run_blocking(
         manifest_integrity_checked,
         files_on_disk,
         files_reported,
+        files_expected,
         file_count_match,
         total_bytes,
     })
+}
+
+/// `idevicebackup2`'s own local bookkeeping files, written at the backup
+/// root once the transfer finishes — real regular files `scan_backup_dir`
+/// counts, but never part of the device's own manifest `Files` table
+/// (checked directly against a real backup: not present there at all).
+const BACKUP_METADATA_FILES: [&str; 4] = ["Status.plist", "Manifest.plist", "Manifest.db", "Info.plist"];
+
+/// How many of `names` actually exist as files directly under `dir`.
+fn count_present(dir: &Path, names: &[&str]) -> u64 {
+    names.iter().filter(|name| dir.join(name).is_file()).count() as u64
+}
+
+/// How many fewer files [`file_count_matches`] tolerates seeing on disk
+/// than expected before treating it as a real gap rather than dedup (see
+/// that function's doc).
+const MAX_DEDUP_SHORTFALL: u64 = 50;
+
+/// Check 3's actual comparison. Not exact equality: confirmed against a
+/// real device, with the bare `idevicebackup2` tool itself (not a
+/// Cradle-specific quirk), that a reported/expected count can run a little
+/// ahead of distinct files on disk — MobileBackup2's storage is content-
+/// addressed by SHA1, so two device-side files with identical bytes
+/// collapse into one file on disk even though the device reported both. A
+/// real dropped-file problem shows up as a gap of hundreds or thousands,
+/// not a handful, so [`MAX_DEDUP_SHORTFALL`] is deliberately generous
+/// while still catching that. More files on disk than expected is never
+/// dedup — that's stale contamination from a previous run — so it's not
+/// tolerated at all.
+fn file_count_matches(files_on_disk: u64, expected: u64) -> bool {
+    files_on_disk <= expected && expected - files_on_disk <= MAX_DEDUP_SHORTFALL
 }
 
 /// Check 1: `Status.plist`'s `SnapshotState` reads `"finished"`.
@@ -131,20 +193,22 @@ fn backup_is_encrypted(backup_dir: &Path) -> bool {
 
 /// Check 2's dispatcher: real `PRAGMA integrity_check` when `password` is
 /// given and decryption succeeds, otherwise the reduced ciphertext-shape
-/// check. Returns `(passed, was_real_check)`.
-fn manifest_db_ok(backup_dir: &Path, encrypted: bool, password: Option<&str>) -> (bool, bool) {
+/// check. Returns `(passed, was_real_check, manifest_file_count)` — the
+/// third field is `Some` only when the manifest was actually opened, and
+/// feeds check 3 (see [`run_blocking`]).
+fn manifest_db_ok(backup_dir: &Path, encrypted: bool, password: Option<&str>) -> (bool, bool, Option<u64>) {
     if let Some(password) = password
         && encrypted
     {
         match real_manifest_integrity_check(backup_dir, password) {
-            Ok(ok) => return (ok, true),
+            Ok((ok, file_count)) => return (ok, true, file_count),
             // A password that's present but wrong, or any other failure
             // decrypting, is a real gate failure — not a reason to fall
             // back to the weaker check, which could mask exactly that.
-            Err(_) => return (false, true),
+            Err(_) => return (false, true, None),
         }
     }
-    (manifest_db_present(backup_dir, encrypted), false)
+    (manifest_db_present(backup_dir, encrypted), false, None)
 }
 
 /// Check 2, reduced scope (see module docs): `Manifest.db` exists, is
@@ -167,7 +231,16 @@ fn manifest_db_present(backup_dir: &Path, encrypted: bool) -> bool {
 /// backup manifest (Keychain/Health/message metadata) sitting in `/tmp`
 /// any longer than it has to is exactly the kind of thing non-negotiable
 /// #2 exists to avoid.
-fn real_manifest_integrity_check(backup_dir: &Path, password: &str) -> Result<bool, CradleError> {
+///
+/// Also reads the manifest's own file count (`Files` table, `flags = 1`
+/// for a regular file — the standard MobileBackup2 schema shared by every
+/// tool that reads it, not a Cradle-specific convention), since it's the
+/// only accurate total for check 3 on an incremental run: `Files` always
+/// lists the *whole current snapshot*, unlike `files_reported`, which is
+/// only what this run itself transferred. `None` if the query fails for
+/// any reason (e.g. an unexpected schema) — check 3 falls back to
+/// `files_reported` rather than failing the gate over this alone.
+fn real_manifest_integrity_check(backup_dir: &Path, password: &str) -> Result<(bool, Option<u64>), CradleError> {
     let manifest_plist = plist::Value::from_file(backup_dir.join("Manifest.plist"))
         .map_err(|e| CradleError::Other(format!("could not read Manifest.plist: {e}")))?;
     let manifest_key = manifest_plist
@@ -183,7 +256,11 @@ fn real_manifest_integrity_check(backup_dir: &Path, password: &str) -> Result<bo
     let temp = TempManifestFile::write(&decrypted)?;
     let conn = rusqlite::Connection::open(&temp.0)?;
     let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    Ok(result == "ok")
+    let file_count = conn
+        .query_row("SELECT COUNT(*) FROM Files WHERE flags = 1", [], |row| row.get::<_, i64>(0))
+        .ok()
+        .map(|n| n.max(0) as u64);
+    Ok((result == "ok", file_count))
 }
 
 /// A decrypted `Manifest.db` written to a private temp file, deleted on
@@ -272,5 +349,27 @@ mod tests {
     fn scan_is_zero_for_missing_directory() {
         let missing = PathBuf::from("/does/not/exist/cradle-test");
         assert_eq!(scan_backup_dir(&missing).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn exact_match_passes() {
+        assert!(file_count_matches(19066, 19066));
+    }
+
+    #[test]
+    fn small_dedup_shortfall_passes() {
+        // The real, confirmed case: idevicebackup2 itself reported 19068
+        // received against 19066 distinct files on disk.
+        assert!(file_count_matches(19066, 19068));
+    }
+
+    #[test]
+    fn large_shortfall_fails() {
+        assert!(!file_count_matches(100, 19068));
+    }
+
+    #[test]
+    fn more_on_disk_than_reported_fails() {
+        assert!(!file_count_matches(19068, 19066));
     }
 }
