@@ -90,6 +90,16 @@ pub struct DeviceEntry {
     ios_version: Option<String>,
     reachable: bool,
     pairing_message: Option<String>,
+    /// Whether the device already has backup encryption on — lets the
+    /// frontend decide up front whether "Back Up Now" needs to walk the
+    /// user through setting a backup password first, instead of only
+    /// finding out from a failed `run_backup` precheck.
+    encryption_enabled: bool,
+    /// Unix seconds of the most recent *verified* snapshot, if any — the
+    /// UI's "Last backed up …" line. `None` covers both "never backed up"
+    /// and "not reachable right now", which the frontend already
+    /// distinguishes via `reachable`/`pairing_message`.
+    last_backup_at: Option<i64>,
 }
 
 /// Lists devices usbmuxd sees, best-effort resolving name/model/iOS
@@ -97,6 +107,7 @@ pub struct DeviceEntry {
 #[tauri::command]
 pub async fn list_devices() -> Result<Vec<DeviceEntry>, String> {
     let attached = device::list().await.map_err(|e| e.to_string())?;
+    let catalog = open_catalog()?;
     let mut out = Vec::with_capacity(attached.len());
 
     for a in attached {
@@ -108,6 +119,8 @@ pub async fn list_devices() -> Result<Vec<DeviceEntry>, String> {
             ios_version: None,
             reachable: false,
             pairing_message: None,
+            encryption_enabled: false,
+            last_backup_at: None,
         };
 
         match device::info(&a.udid).await {
@@ -116,9 +129,16 @@ pub async fn list_devices() -> Result<Vec<DeviceEntry>, String> {
                 entry.product_type = Some(info.product_type);
                 entry.ios_version = Some(info.ios_version);
                 entry.reachable = true;
+                entry.encryption_enabled = cradle_core::libimobiledevice::will_encrypt(&a.udid).await;
             }
             Err(e) => entry.pairing_message = Some(e.to_string()),
         }
+
+        entry.last_backup_at = catalog
+            .latest_verified_snapshot(&a.udid)
+            .ok()
+            .flatten()
+            .map(|s| s.taken_at);
 
         out.push(entry);
     }
