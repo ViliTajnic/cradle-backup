@@ -16,7 +16,6 @@
 //! doesn't reintroduce the LGPL-linking concern the old `idevice`-only
 //! stack avoided. Install with `brew install libimobiledevice`.
 
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,35 +27,13 @@ use tracing::{info, warn};
 use crate::CradleError;
 use crate::backup::ProgressSink;
 
-/// Extra places to look for these tools beyond `PATH` — Homebrew's default
-/// prefixes on Apple Silicon and Intel Macs. A GUI app launched from
-/// Finder/Dock (unlike a shell) doesn't always inherit Homebrew's `PATH`
-/// entry.
-const EXTRA_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
-
-fn tool_path(name: &'static str) -> Result<PathBuf, CradleError> {
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-    for dir in EXTRA_TOOL_DIRS {
-        let candidate = Path::new(dir).join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(CradleError::ToolNotFound(name))
-}
 
 /// Runs a short-lived tool to completion and captures its output — for the
 /// quick, one-shot queries (`idevice_id`, `ideviceinfo`, `idevicepair`), not
 /// the long-running `idevicebackup2` transfer (see [`run_idevicebackup2`]).
 async fn run_capture(tool: &'static str, args: &[&str]) -> Result<(bool, String, String), CradleError> {
-    let path = tool_path(tool)?;
+    let path = crate::tools::resolve(tool)
+        .map_err(|e| CradleError::Other(format!("{e} — install libimobiledevice with `brew install libimobiledevice`")))?;
     let output = Command::new(path)
         .args(args)
         .output()
@@ -141,7 +118,7 @@ async fn info_bool(udid: &str, domain: &str, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-/// Display metadata read from lockdownd — mirrors `crate::device::DeviceInfo`.
+/// Display metadata read from lockdownd — mirrors `crate::libimobiledevice::DeviceInfo`.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub udid: String,
@@ -150,18 +127,39 @@ pub struct DeviceInfo {
     pub ios_version: String,
 }
 
+/// Reads every root-domain lockdown value in one `ideviceinfo` call
+/// instead of one call per key — [`device_info`] used to run three
+/// separate queries (`DeviceName`, `ProductType`, `ProductVersion`),
+/// which is three subprocess round trips' worth of latency (mostly USB
+/// protocol overhead, not CPU) to answer what's really one question.
+/// `ideviceinfo` with no `-k` prints the whole domain as `Key: Value`
+/// lines — some values span multiple indented lines (nested plist dicts),
+/// but every key this module actually reads is always a plain one-line
+/// string, so scanning for an exact `"<key>: "` line prefix is enough;
+/// this never needs to parse the nested cases.
+async fn info_domain(udid: &str) -> Result<String, CradleError> {
+    let (ok, stdout, stderr) = run_capture("ideviceinfo", &["-u", udid]).await?;
+    if !ok {
+        return Err(CradleError::ToolFailed(if stderr.is_empty() { stdout } else { stderr }));
+    }
+    Ok(stdout)
+}
+
+fn domain_value<'a>(domain: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}: ");
+    domain.lines().find_map(|line| line.strip_prefix(prefix.as_str()))
+}
+
 /// Reads the handful of lockdown values Cradle needs to identify and
 /// display a device. A hard error here (unlike [`info_bool`]'s soft
 /// default) means the device genuinely isn't reachable.
 pub async fn device_info(udid: &str) -> Result<DeviceInfo, CradleError> {
-    let name = info_value(udid, None, "DeviceName").await?.unwrap_or_default();
-    let product_type = info_value(udid, None, "ProductType").await?.unwrap_or_default();
-    let ios_version = info_value(udid, None, "ProductVersion").await?.unwrap_or_default();
+    let domain = info_domain(udid).await?;
     Ok(DeviceInfo {
         udid: udid.to_string(),
-        name,
-        product_type,
-        ios_version,
+        name: domain_value(&domain, "DeviceName").unwrap_or_default().to_string(),
+        product_type: domain_value(&domain, "ProductType").unwrap_or_default().to_string(),
+        ios_version: domain_value(&domain, "ProductVersion").unwrap_or_default().to_string(),
     })
 }
 
@@ -177,6 +175,21 @@ pub async fn will_encrypt(udid: &str) -> bool {
 /// on a Find My-locked device.
 pub async fn find_my_associated(udid: &str) -> bool {
     info_bool(udid, "com.apple.fmip", "IsAssociated", true).await
+}
+
+/// Bytes free on the device's own data volume, read from the
+/// `com.apple.disk_usage` domain's `AmountDataAvailable` — the restore
+/// precheck's equivalent of `precheck::free_disk_space` for the *target
+/// device* rather than this Mac's disk. `None` when it can't be read
+/// (older iOS, transient query failure); the caller treats that as
+/// "unknown," never as "assume plenty," same reasoning as the host-side
+/// check.
+pub async fn available_disk_space(udid: &str) -> Option<u64> {
+    info_value(udid, Some("com.apple.disk_usage"), "AmountDataAvailable")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
 }
 
 /// Result of `idevicepair validate`.
@@ -284,7 +297,8 @@ fn parse_overall_percent(line: &str) -> Option<f64> {
 }
 
 /// Parses a per-file progress line's `(done/total)` byte fraction, e.g.
-/// `"[===   ]  42% (1.2 MB/3.4 MB)"`.
+/// `"[===   ]  42% (1.2 MB/3.4 MB)"` — the shape `idevicebackup2 backup`
+/// prints per file as it *receives* one.
 fn parse_file_bytes(line: &str) -> Option<(u64, u64)> {
     let start = line.rfind('(')?;
     let end = line.rfind(')')?;
@@ -293,6 +307,22 @@ fn parse_file_bytes(line: &str) -> Option<(u64, u64)> {
     }
     let (done, total) = line[start + 1..end].split_once('/')?;
     Some((parse_human_bytes(done.trim())?, parse_human_bytes(total.trim())?))
+}
+
+/// Parses a restore's own per-file announcement, e.g.
+/// `"Sending 'ab/cd1234...' (1.2 MB)"` — confirmed via `strings` on the
+/// installed `idevicebackup2` binary that restore's send loop uses this
+/// single-size format, not backup's `(done/total)` fraction, so
+/// [`parse_file_bytes`] never matches a single line of it. Before this,
+/// every restore's FILES and RATE readouts sat at 0 for the entire
+/// on-device transfer — only the shared overall-percent line (see
+/// [`parse_overall_percent`]) ever moved — because nothing recognized
+/// this format at all.
+fn parse_sending_file(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix("Sending '")?;
+    let (_name, rest) = rest.split_once("' (")?;
+    let size = rest.strip_suffix(')')?;
+    parse_human_bytes(size.trim())
 }
 
 fn parse_human_bytes(s: &str) -> Option<u64> {
@@ -326,6 +356,10 @@ fn classify_error(message: &str) -> CradleError {
         CradleError::DeviceLocked
     } else if has_code("104") {
         CradleError::HostIoError
+    } else if has_code("207") {
+        CradleError::WrongBackupPassword
+    } else if message.contains("Could not start service com.apple.mobilebackup2") {
+        CradleError::DeviceNotReadyForBackupService
     } else {
         CradleError::ToolFailed(message.to_string())
     }
@@ -427,6 +461,14 @@ impl ProgressParser {
             return;
         }
 
+        if let Some(size) = parse_sending_file(line) {
+            self.bytes_done += size;
+            self.files += 1;
+            self.progress.on_file(line, self.files);
+            self.sync_state();
+            return;
+        }
+
         if let Some(rest) = line.strip_prefix("Received ")
             && let Some(n) = rest.split_whitespace().next().and_then(|s| s.parse::<u64>().ok())
         {
@@ -472,9 +514,13 @@ pub(crate) async fn run_idevicebackup2(args: &[&str], env: &[(&str, &str)], prog
         bytes_transferred: 0,
     };
 
-    let path = match tool_path("idevicebackup2") {
+    let path = match crate::tools::resolve("idevicebackup2") {
         Ok(path) => path,
-        Err(e) => return no_progress(e),
+        Err(e) => {
+            return no_progress(CradleError::Other(format!(
+                "{e} — install libimobiledevice with `brew install libimobiledevice`"
+            )));
+        }
     };
     let mut cmd = Command::new(path);
     cmd.args(args);
@@ -506,10 +552,21 @@ pub(crate) async fn run_idevicebackup2(args: &[&str], env: &[(&str, &str)], prog
         .await;
     });
 
+    // Bounded to the last few lines rather than collected wholesale: only
+    // the single most recent non-empty line is ever read back out (below),
+    // so an unbounded `Vec` here would just be memory an unusually chatty
+    // or long-running `idevicebackup2` process never needed to cost us.
+    const STDERR_TAIL_LINES: usize = 50;
     let stderr_task = tokio::spawn(async move {
-        let mut lines = Vec::new();
-        stream_lines(stderr, |line| lines.push(line.to_string())).await;
-        lines
+        let mut lines = std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES);
+        stream_lines(stderr, |line| {
+            if lines.len() == STDERR_TAIL_LINES {
+                lines.pop_front();
+            }
+            lines.push_back(line.to_string());
+        })
+        .await;
+        Vec::from(lines)
     });
 
     enum Resolution {
@@ -552,11 +609,23 @@ pub(crate) async fn run_idevicebackup2(args: &[&str], env: &[(&str, &str)], prog
     let outcome = if status.success() && parsed.saw_success {
         Ok(())
     } else {
-        let message = parsed
-            .last_error
-            .clone()
-            .or_else(|| stderr_lines.into_iter().rev().find(|l| !l.trim().is_empty()))
-            .unwrap_or_else(|| format!("idevicebackup2 exited with status {status}"));
+        // A bare "exited with status 255 (or similar) and printed nothing at
+        // all" has shown up on a real device with an otherwise-healthy
+        // pairing — every other failure mode this code knows about prints
+        // *something* (an ErrorCode line, "Aborted", a lockdownd error).
+        // Confirmed via direct manual `idevicebackup2` runs against the
+        // same device that this is consistent with a dropped USB/network
+        // connection to the device mid-connect, not a Cradle-side bug —
+        // CLAUDE.md: "Error messages name the fix, not the symptom," so
+        // this names the fix even though the tool gave nothing to classify.
+        let message = parsed.last_error.clone().or_else(|| stderr_lines.into_iter().rev().find(|l| !l.trim().is_empty())).unwrap_or_else(|| {
+            format!(
+                "idevicebackup2 exited unexpectedly ({status}) without printing an error — this \
+                 usually means the connection to the device dropped before the backup protocol \
+                 could even start. Check the cable/USB connection, make sure the device is \
+                 unlocked and still shows as trusted, and try again."
+            )
+        });
         warn!(
             bytes_transferred = parsed.bytes_done,
             files_received = parsed.files_received,
@@ -569,5 +638,79 @@ pub(crate) async fn run_idevicebackup2(args: &[&str], env: &[(&str, &str)], prog
         outcome,
         files_received: parsed.files_received,
         bytes_transferred: parsed.bytes_done,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real (anonymized) `ideviceinfo` root-domain output shape, nested
+    /// multi-line value included — `domain_value` must skip past that
+    /// without getting confused, since it's real output shape, not a
+    /// simplified fixture.
+    const SAMPLE_DOMAIN: &str = "\
+ActivationState: Activated
+BasebandKeyHashInformation: AKeyStatus: 2
+ SKeyHash: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+ SKeyStatus: 0
+DeviceName: Backup iPhone
+ProductType: iPhone14,7
+ProductVersion: 26.5.2";
+
+    #[test]
+    fn reads_simple_string_keys_around_a_nested_multiline_one() {
+        assert_eq!(domain_value(SAMPLE_DOMAIN, "DeviceName"), Some("Backup iPhone"));
+        assert_eq!(domain_value(SAMPLE_DOMAIN, "ProductType"), Some("iPhone14,7"));
+        assert_eq!(domain_value(SAMPLE_DOMAIN, "ProductVersion"), Some("26.5.2"));
+    }
+
+    #[test]
+    fn missing_key_is_none() {
+        assert_eq!(domain_value(SAMPLE_DOMAIN, "NoSuchKey"), None);
+    }
+
+    #[test]
+    fn a_value_containing_a_colon_is_read_in_full() {
+        let domain = "DeviceName: Vili's: iPhone";
+        assert_eq!(domain_value(domain, "DeviceName"), Some("Vili's: iPhone"));
+    }
+
+    /// `idevicebackup2`'s own fallback for a code it doesn't recognize
+    /// either ("Restore Failed (Error Code 207)." — confirmed via `strings`
+    /// on the installed binary, which only special-cases a handful of
+    /// codes) — found on a real cross-device restore where the override
+    /// password was wrong, and the error shown carried no more information
+    /// than the bare number until this classification existed.
+    #[test]
+    fn error_code_207_is_classified_as_a_wrong_backup_password() {
+        assert!(matches!(
+            classify_error("Restore Failed (Error Code 207)."),
+            CradleError::WrongBackupPassword
+        ));
+    }
+
+    /// Confirmed on a real device mid-Setup Assistant: pairing/Trust can
+    /// succeed before iOS enables `com.apple.mobilebackup2`, so this shows
+    /// up as its own distinct failure — not a pairing problem, and not one
+    /// of the numbered `ErrorCode` failures at all.
+    #[test]
+    fn mobilebackup2_service_unavailable_is_classified_as_device_not_ready() {
+        assert!(matches!(
+            classify_error("ERROR: Could not start service com.apple.mobilebackup2: Invalid service"),
+            CradleError::DeviceNotReadyForBackupService
+        ));
+    }
+
+    #[test]
+    fn parses_a_restore_send_line_size() {
+        assert_eq!(parse_sending_file("Sending 'ab/cd1234567890' (1.2 MB)"), Some(1_258_291));
+    }
+
+    #[test]
+    fn a_backup_receive_fraction_line_is_not_mistaken_for_a_restore_send_line() {
+        // Same message family, different shape — must not cross-match.
+        assert_eq!(parse_sending_file("[===   ]  42% (1.2 MB/3.4 MB)"), None);
+        assert!(parse_file_bytes("Sending 'ab/cd1234567890' (1.2 MB)").is_none());
     }
 }

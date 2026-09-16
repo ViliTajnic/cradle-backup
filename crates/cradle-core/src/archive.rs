@@ -18,7 +18,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::CradleError;
@@ -84,6 +84,11 @@ fn error_hint(code: i64) -> Option<&'static str> {
 /// real repository, not a hypothetical. Reading the password here, in the
 /// same process that owns the Keychain item, stays inside that ACL and
 /// never prompts.
+/// How many trailing stderr lines [`run_streaming`] keeps for
+/// [`parse_error`] — see that field's own doc for why this is bounded
+/// rather than collecting everything.
+const STDERR_TAIL_LINES: usize = 200;
+
 async fn run_streaming(
     destination: &DestinationRecord,
     args: &[String],
@@ -94,7 +99,15 @@ async fn run_streaming(
         message: format!("could not read repository password from Keychain: {e}"),
     })?;
 
-    let mut cmd = Command::new("restic");
+    // Same resolver `libimobiledevice.rs` uses, not a bare `Command::new`
+    // trusting inherited `PATH` alone — a GUI app launched from Finder/Dock
+    // doesn't always have Homebrew's PATH entry, and this crate already
+    // hit that exact problem for the device tools. See `tools.rs`.
+    let restic_path = crate::tools::resolve("restic").map_err(|e| ResticError {
+        code: None,
+        message: format!("{e} (try `brew install restic`)"),
+    })?;
+    let mut cmd = Command::new(restic_path);
     cmd.arg("--repo")
         .arg(&destination.uri)
         .env("RESTIC_PASSWORD", &password)
@@ -106,9 +119,7 @@ async fn run_streaming(
 
     let mut child = cmd.spawn().map_err(|e| ResticError {
         code: None,
-        message: format!(
-            "could not start restic — is it installed and on PATH? (try `brew install restic`): {e}"
-        ),
+        message: format!("could not start restic: {e}"),
     })?;
 
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -116,11 +127,22 @@ async fn run_streaming(
 
     // Drain stderr concurrently on its own task: if we only read stdout,
     // a child that fills the stderr pipe buffer would deadlock waiting for
-    // us to read it.
+    // us to read it. Bounded to the last STDERR_TAIL_LINES rather than
+    // collected wholesale — `parse_error` below only ever needs the most
+    // recent lines (to reverse-search for a JSON error message, or as a
+    // last-resort text fallback), and an unbounded buffer here means a
+    // restic bug that floods stderr costs us memory proportional to
+    // however long the run had been going, not to the error itself.
     let stderr_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
-        buf
+        let mut lines = std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES);
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            if lines.len() == STDERR_TAIL_LINES {
+                lines.pop_front();
+            }
+            lines.push_back(line);
+        }
+        Vec::from(lines).join("\n")
     });
 
     let mut lines = BufReader::new(stdout).lines();
@@ -467,6 +489,74 @@ struct ForgetGroup {
     remove: Option<Vec<serde_json::Value>>,
 }
 
+/// One snapshot restic reported as kept or removed by a retention policy —
+/// just enough to show a person which backup that actually is, pulled out
+/// of `restic forget`'s full per-snapshot JSON object.
+#[derive(Debug, Clone)]
+pub struct RetentionPreviewEntry {
+    pub short_id: String,
+    pub time: String,
+}
+
+fn parse_preview_entries(values: Option<Vec<serde_json::Value>>) -> Vec<RetentionPreviewEntry> {
+    values
+        .unwrap_or_default()
+        .iter()
+        .map(|v| RetentionPreviewEntry {
+            short_id: v.get("short_id").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+            time: v.get("time").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+        })
+        .collect()
+}
+
+/// What applying `policy` would do, without actually doing it.
+#[derive(Debug, Clone, Default)]
+pub struct RetentionPreview {
+    pub kept: Vec<RetentionPreviewEntry>,
+    pub removed: Vec<RetentionPreviewEntry>,
+}
+
+fn require_policy_args(policy: &RetentionPolicy) -> Result<Vec<String>, CradleError> {
+    let args = policy.to_args();
+    if args.is_empty() {
+        return Err(CradleError::Other(
+            "no retention policy given — pass at least one of keep_last/keep_daily/keep_weekly/keep_monthly"
+                .into(),
+        ));
+    }
+    Ok(args)
+}
+
+async fn run_forget(destination: &DestinationRecord, args: Vec<String>) -> Result<Vec<ForgetGroup>, CradleError> {
+    let mut output = String::new();
+    run_streaming(destination, &args, |line| {
+        output.push_str(line);
+        output.push('\n');
+    })
+    .await?;
+
+    serde_json::from_str(output.trim())
+        .map_err(|e| CradleError::Other(format!("could not parse restic forget output: {e}")))
+}
+
+/// Shows which snapshots applying `policy` would keep or remove, without
+/// actually removing anything — `restic forget --dry-run`.
+/// CODEBASE_ANALYSIS.md: "Retention preview: Show which snapshots will be
+/// removed before applying retention."
+pub async fn preview_retention(
+    destination: &DestinationRecord,
+    policy: &RetentionPolicy,
+) -> Result<RetentionPreview, CradleError> {
+    let mut args = vec!["forget".to_string(), "--dry-run".to_string()];
+    args.extend(require_policy_args(policy)?);
+
+    let groups = run_forget(destination, args).await?;
+    Ok(RetentionPreview {
+        kept: groups.iter().flat_map(|g| parse_preview_entries(g.keep.clone())).collect(),
+        removed: groups.iter().flat_map(|g| parse_preview_entries(g.remove.clone())).collect(),
+    })
+}
+
 /// Applies `policy` to `destination`'s repository via `restic forget
 /// --prune`, actually reclaiming space rather than just dropping snapshot
 /// references (`--prune` — CLAUDE.md's "retention logic ... restic owns
@@ -476,27 +566,10 @@ pub async fn forget_and_prune(
     destination: &DestinationRecord,
     policy: &RetentionPolicy,
 ) -> Result<ForgetSummary, CradleError> {
-    let policy_args = policy.to_args();
-    if policy_args.is_empty() {
-        return Err(CradleError::Other(
-            "no retention policy given — pass at least one of keep_last/keep_daily/keep_weekly/keep_monthly"
-                .into(),
-        ));
-    }
-
     let mut args = vec!["forget".to_string(), "--prune".to_string()];
-    args.extend(policy_args);
+    args.extend(require_policy_args(policy)?);
 
-    let mut output = String::new();
-    run_streaming(destination, &args, |line| {
-        output.push_str(line);
-        output.push('\n');
-    })
-    .await?;
-
-    let groups: Vec<ForgetGroup> = serde_json::from_str(output.trim())
-        .map_err(|e| CradleError::Other(format!("could not parse restic forget output: {e}")))?;
-
+    let groups = run_forget(destination, args).await?;
     Ok(ForgetSummary {
         kept: groups.iter().flat_map(|g| g.keep.as_deref()).flatten().count() as u64,
         removed: groups.iter().flat_map(|g| g.remove.as_deref()).flatten().count() as u64,
@@ -510,14 +583,69 @@ pub struct CheckSummary {
     pub num_errors: u64,
 }
 
-/// Runs a full repository integrity check. Heavier than the per-archive
-/// verification [`crate::catalog::Catalog::finish_archive`] already does
-/// (restic checksums everything it writes as part of `backup` itself) —
-/// this is for a periodic, explicit audit, not something to run after
-/// every single archive.
-pub async fn check(destination: &DestinationRecord) -> Result<CheckSummary, CradleError> {
+/// How thoroughly [`check`] reads a repository. Plain `restic check`
+/// (`CheckMode::Quick`) only verifies structure — that the index and
+/// snapshots are internally consistent and every pack file *exists* — not
+/// that any pack file's actual bytes are intact; bit rot or partial
+/// corruption on the storage backend passes it silently.
+/// CODEBASE_ANALYSIS.md: "`archive::check` invokes plain `restic check`,
+/// while CLI wording claims it reads the entire repository. Plain check
+/// does not read and verify all pack contents."
+///
+/// [Restic's own docs on this distinction](https://restic.readthedocs.io/en/stable/045_working_with_repos.html#checking-integrity-and-consistency).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckMode {
+    /// `restic check` — structure only, seconds even for a large
+    /// repository. Good for "did the last archive leave things sane",
+    /// not for "is my data still readable."
+    Quick,
+    /// `restic check --read-data` — downloads and checksums every pack
+    /// file. Actually reads the whole repository, at the cost of
+    /// transferring all of it again; can take as long as the original
+    /// archive did, longer over a slow link.
+    Full,
+    /// `restic check --read-data-subset=<percent>%` — checksums a random
+    /// sample instead of everything, catching the same class of silent
+    /// storage-level corruption `Full` does at a fraction of the cost.
+    /// `percent` is clamped to `1..=100`.
+    Sample { percent: u8 },
+}
+
+impl CheckMode {
+    fn extra_args(self) -> Vec<String> {
+        match self {
+            CheckMode::Quick => vec![],
+            CheckMode::Full => vec!["--read-data".to_string()],
+            CheckMode::Sample { percent } => {
+                vec![format!("--read-data-subset={}%", percent.clamp(1, 100))]
+            }
+        }
+    }
+
+    /// One line naming what this mode actually does — CLI/app wording
+    /// should say this instead of inventing its own claim about how much
+    /// of the repository was read.
+    pub fn description(self) -> &'static str {
+        match self {
+            CheckMode::Quick => "checking repository structure (not pack contents — use --full or --sample for that)",
+            CheckMode::Full => "reading and verifying every byte in the repository — this can take as long as the original archive",
+            CheckMode::Sample { .. } => "reading and verifying a random sample of the repository",
+        }
+    }
+}
+
+/// Runs a repository check at `mode`'s thoroughness. Even `CheckMode::Full`
+/// is heavier than the per-archive verification
+/// [`crate::catalog::Catalog::finish_archive`] already does (restic
+/// checksums everything it writes as part of `backup` itself) — this is
+/// for a periodic, explicit audit, not something to run after every single
+/// archive.
+pub async fn check(destination: &DestinationRecord, mode: CheckMode) -> Result<CheckSummary, CradleError> {
+    let mut args = vec!["check".to_string()];
+    args.extend(mode.extra_args());
+
     let mut summary: Option<CheckSummary> = None;
-    run_streaming(destination, &["check".to_string()], |line| {
+    run_streaming(destination, &args, |line| {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
             && value.get("message_type").and_then(|v| v.as_str()) == Some("summary")
             && let Ok(parsed) = serde_json::from_value(value)
@@ -534,6 +662,36 @@ pub async fn check(destination: &DestinationRecord) -> Result<CheckSummary, Crad
 mod tests {
     use super::*;
     use crate::backup::NullProgress;
+
+    #[test]
+    fn quick_check_adds_no_extra_flags() {
+        assert!(CheckMode::Quick.extra_args().is_empty());
+    }
+
+    #[test]
+    fn full_check_reads_all_data() {
+        assert_eq!(CheckMode::Full.extra_args(), vec!["--read-data".to_string()]);
+    }
+
+    #[test]
+    fn sample_check_uses_the_requested_percentage() {
+        assert_eq!(
+            CheckMode::Sample { percent: 10 }.extra_args(),
+            vec!["--read-data-subset=10%".to_string()]
+        );
+    }
+
+    #[test]
+    fn sample_check_clamps_an_out_of_range_percentage() {
+        assert_eq!(
+            CheckMode::Sample { percent: 0 }.extra_args(),
+            vec!["--read-data-subset=1%".to_string()]
+        );
+        assert_eq!(
+            CheckMode::Sample { percent: 255 }.extra_args(),
+            vec!["--read-data-subset=100%".to_string()]
+        );
+    }
 
     fn test_destination(uri: &str, credential_ref: &str) -> DestinationRecord {
         DestinationRecord {
@@ -580,7 +738,7 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].id, summary.snapshot_id);
 
-        let check_summary = check(&destination).await.unwrap();
+        let check_summary = check(&destination, CheckMode::Full).await.unwrap();
         assert_eq!(check_summary.num_errors, 0);
 
         let forgotten = forget_and_prune(

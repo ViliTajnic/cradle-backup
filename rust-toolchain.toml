@@ -1,5 +1,6 @@
 [toolchain]
-# ROADMAP.md's floor is Rust 1.85+ (edition 2024), but the idevice crate's own
-# source uses if-let chains internally, which need a newer stable than 1.85.
-# Track stable rather than pin an exact patch so that stays satisfied.
+# ROADMAP.md's floor is Rust 1.85+ (edition 2024), but Cradle's own code uses
+# let-chains (`if let Some(x) = a && b { ... }`), which need a newer stable
+# than 1.85. Track stable rather than pin an exact patch so that stays
+# satisfied.
 channel = "stable"

@@ -15,15 +15,19 @@ pub mod archive;
 pub mod backup;
 pub mod catalog;
 pub mod crypto;
-pub mod device;
 pub mod keychain;
 pub mod libimobiledevice;
+pub mod lock;
 pub mod memory;
 pub mod notify;
+pub mod paths;
 pub mod power;
 pub mod precheck;
 pub mod restore;
+pub mod signals;
+pub mod tools;
 pub mod verify;
+pub mod workflow;
 
 /// Errors that can occur anywhere in the Cradle core: `libimobiledevice`
 /// CLI-tool failures, local filesystem failures, or a handful of
@@ -36,10 +40,15 @@ pub enum CradleError {
     #[error("catalog error: {0}")]
     Catalog(#[from] rusqlite::Error),
 
-    /// A `libimobiledevice` CLI tool (`idevice_id`, `ideviceinfo`,
-    /// `idevicepair`, `idevicebackup2`) isn't on `PATH` or in one of the
-    /// usual Homebrew prefixes.
-    #[error("`{0}` not found — install libimobiledevice with `brew install libimobiledevice`")]
+    /// An external tool `crate::tools::resolve` looked for (a
+    /// `libimobiledevice` CLI tool, or `restic`) isn't on `PATH` or in one
+    /// of the usual Homebrew prefixes. Deliberately names only the tool,
+    /// not an install command: `restic` and the `libimobiledevice` tools
+    /// come from different packages, and a wrong hint here (this used to
+    /// always say "install libimobiledevice" even for a missing `restic`)
+    /// is worse than no hint — callers that know which package a given
+    /// tool comes from append their own.
+    #[error("`{0}` not found on PATH or in the usual Homebrew prefixes")]
     ToolNotFound(&'static str),
 
     /// A `libimobiledevice` CLI tool exited non-zero or printed an error of
@@ -95,6 +104,37 @@ pub enum CradleError {
          device is unlocked and awake if it keeps happening"
     )]
     Stalled,
+
+    /// MBErrorDomain 207 — the device rejected the backup password given
+    /// for restore (it can't unlock the backup's keybag with it). Split
+    /// out from [`Self::Other`] so this shows up as a wrong password
+    /// rather than the device's own opaque "Restore Failed (Error Code
+    /// 207)." — confirmed against a real restore attempt where that raw
+    /// text was the *entire* error shown, with nothing naming what 207
+    /// actually means (CLAUDE.md: "Error messages name the fix, not the
+    /// symptom").
+    #[error(
+        "the backup password Cradle sent was rejected — the device could not unlock this \
+         backup with it. Double-check the password (or use the override field if this backup \
+         used a different one than what's stored) and try again."
+    )]
+    WrongBackupPassword,
+
+    /// `idevicebackup2` couldn't even start the `com.apple.mobilebackup2`
+    /// lockdownd service — confirmed on a real device mid-`Setup
+    /// Assistant`: pairing/Trust can succeed early, but iOS keeps this
+    /// service disabled until the device has cleared enough of initial
+    /// activation, the same gate Finder's own "Restore from Mac" option is
+    /// hidden behind until the "Apps & Data" screen. Not a Cradle bug and
+    /// not retryable on a timer — the device needs to move further through
+    /// setup first.
+    #[error(
+        "the device isn't ready for a backup or restore yet — this happens when it hasn't gotten \
+         far enough through initial setup (or activation) for iOS to enable that service. Get it \
+         to the Wi-Fi / Apple ID / \"Apps & Data\" step in Setup Assistant (or finish setup \
+         entirely) and try again."
+    )]
+    DeviceNotReadyForBackupService,
 
     #[error("{0}")]
     Other(String),

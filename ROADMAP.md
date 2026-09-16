@@ -12,8 +12,8 @@ Exit criteria:
 - [x] Connects to a device on current iOS — confirmed against a real
       iPhone (iPhone18,3, iOS 26.6.1) over USB.
 - [x] Backup encryption check returns true — confirmed via lockdown's
-      `WillEncrypt` (the `idevice` crate's own `check_backup_encryption()`
-      is a stub that errors; we don't use it — see `precheck.rs`).
+      `WillEncrypt`, read directly via `ideviceinfo`/`libimobiledevice`
+      (see `precheck.rs`).
 - [x] Progress line shows moving bytes, rate, file count, ETA — confirmed
       with real numbers (files/%/rate/bytes/ETA) on a live transfer.
 - [ ] **Second run is dramatically faster than the first** — **not yet
@@ -36,8 +36,8 @@ into the original scaffold:
   `Integer(n)` dump — see `device_error_hint` in `backup.rs`.
 
 Requires Rust 1.85+ (edition 2024); `rust-toolchain.toml` tracks `stable`
-in practice, since `idevice`'s own source needs a newer stable than 1.85
-for if-let chains.
+in practice, since Cradle's own code needs a newer stable than 1.85 for
+let-chains.
 
 ## M1 — Verification gate 🟡 implemented, unexercised against a completed run
 
@@ -152,10 +152,10 @@ restore — backing up `/tmp/rrt/source/UDID` and restoring into
 the resolved path is computed from the snapshot's own recorded `paths[0]`
 rather than assumed.
 
-`RestoreOptions.reboot`/`.system_files` are exposed; nothing else — per
-CLAUDE.md, selective restore isn't happening, and the remaining flags on
-`idevice`'s `RestoreOptions` don't have an obvious default worth exposing
-yet.
+`RestoreConfig.reboot`/`.system_files` are exposed, mapping to
+`idevicebackup2 restore`'s own `--no-reboot`/`--system` flags; nothing
+else — per CLAUDE.md, selective restore isn't happening, and the tool's
+remaining flags don't have an obvious default worth exposing yet.
 
 The two restore-only prechecks: Find My via lockdown's `com.apple.fmip`
 domain, key `IsAssociated` (undocumented by Apple, but well attested by

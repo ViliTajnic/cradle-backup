@@ -34,19 +34,28 @@ use crate::CradleError;
 
 /// Keychain service name every Cradle-managed restic repository password is
 /// stored under. Individual destinations are distinguished by `account`
-/// (see [`destination_account`]), not by service.
+/// (see [`new_destination_account`]), not by service.
 pub const SERVICE: &str = "com.cradle.restic-repo-password";
 
-/// The Keychain `account` a destination's password lives under. This is
-/// exactly what `destinations.credential_ref` holds in the catalog — a
-/// lookup key, never the secret itself.
+/// A fresh, unique Keychain `account` for a new destination's password.
+/// Whatever this returns becomes `destinations.credential_ref` in the
+/// catalog — a lookup key, never the secret itself — and every later
+/// lookup reads that stored value back rather than recomputing this
+/// function, so nothing needs it to be deterministic.
 ///
-/// Keyed by the destination's (unique) *name* rather than its catalog id:
-/// the id doesn't exist until after `INSERT`, and generating the Keychain
-/// entry before that insert — so a half-created destination is never
-/// recorded — needs a key that doesn't depend on it.
-pub fn destination_account(destination_name: &str) -> String {
-    format!("cradle-destination-{destination_name}")
+/// Deliberately *not* derived only from `destination_name`: two
+/// independent catalogs on the same Mac naming a destination the same
+/// thing (a reinstall, a second `--catalog` file, ...) would otherwise
+/// share one Keychain slot — CODEBASE_ANALYSIS.md flagged exactly this.
+/// The random suffix is generated before the destination's catalog
+/// `INSERT` (whose row id doesn't exist yet), so a half-created
+/// destination never gets recorded with no matching Keychain item, but
+/// two destinations can never collide regardless of what they're named.
+pub fn new_destination_account(destination_name: &str) -> String {
+    let mut suffix = [0u8; 8];
+    rand::rng().fill(&mut suffix);
+    let suffix: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+    format!("cradle-destination-{destination_name}-{suffix}")
 }
 
 /// The Keychain `account` a device's *backup* password lives under —

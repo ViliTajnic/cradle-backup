@@ -23,16 +23,32 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|_app| {
+            // Same reasoning as cradle-cli's main(): a Force Quit via
+            // Activity Monitor sends a signal to just this process, not
+            // its process group, and would otherwise orphan an in-flight
+            // `idevicebackup2`/`restic` — see `signals.rs`.
+            tauri::async_runtime::spawn(cradle_core::signals::wait_and_propagate_termination());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::list_devices,
             commands::enable_encryption,
+            commands::store_existing_password,
+            commands::verify_stored_password,
             commands::run_backup,
             commands::get_history,
             commands::list_destinations,
             commands::add_destination,
+            commands::list_archive_snapshots,
             commands::remove_destination,
+            commands::show_destination_password,
+            commands::connect_destination,
             commands::run_archive,
             commands::list_restore_sources,
+            commands::list_local_backups,
+            commands::delete_local_backup,
             commands::run_restore,
         ])
         .run(tauri::generate_context!())

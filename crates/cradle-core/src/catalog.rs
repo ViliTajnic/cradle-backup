@@ -15,6 +15,7 @@
 //! encryption").
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -82,8 +83,17 @@ CREATE INDEX IF NOT EXISTS archives_destination ON archives(destination_id);
 /// Handle to the catalog database. One per process is plenty — this is
 /// small, local, and only ever touched briefly before/after a transfer,
 /// never during one.
+///
+/// The connection is `Mutex`-wrapped so `Catalog` is `Sync`, not just
+/// `Send`: `workflow.rs` holds a `Catalog` across `.await` points
+/// alongside other operations, and a plain `rusqlite::Connection` is
+/// `Send` but not `Sync` — a `&Catalog` held across an await would make
+/// the enclosing future un-`Send`, which Tauri's command futures must be.
+/// Actual contention is essentially nonexistent in practice (this is a
+/// small local database touched briefly around a transfer, not during
+/// one), so a plain `Mutex` costs nothing worth measuring.
 pub struct Catalog {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 /// What kind of operation a [`runs`] row records.
@@ -131,7 +141,7 @@ pub struct DeviceRecord {
 }
 
 /// One row from `runs`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RunRecord {
     pub id: i64,
     pub udid: String,
@@ -145,7 +155,7 @@ pub struct RunRecord {
 }
 
 /// One row from `snapshots`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SnapshotRecord {
     pub id: i64,
     pub udid: String,
@@ -167,7 +177,7 @@ pub struct DestinationRecord {
     pub name: String,
     pub kind: String,
     pub uri: String,
-    /// Keychain account — see [`crate::keychain::destination_account`].
+    /// Keychain account — see [`crate::keychain::new_destination_account`].
     /// Never the password itself.
     pub credential_ref: String,
     pub retention_json: Option<String>,
@@ -225,7 +235,16 @@ impl Catalog {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// Locks the connection. A poisoned lock (only possible if a prior
+    /// call panicked mid-statement) still yields the connection rather
+    /// than poisoning every future call forever — the data underneath is
+    /// exactly as valid as it was before the panic; SQLite's own
+    /// transaction semantics are what actually protect it.
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The default catalog location: the platform data directory (e.g.
@@ -238,7 +257,7 @@ impl Catalog {
 
     /// Inserts or updates a device's row, bumping `last_seen` to now.
     pub fn upsert_device(&self, device: &DeviceRecord) -> Result<(), CradleError> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO devices (udid, name, product_type, ios_version, last_seen, encrypted)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(udid) DO UPDATE SET
@@ -265,7 +284,8 @@ impl Catalog {
     /// [`crate::restore::run`] is that the backup being restored can come
     /// from a device that's no longer around.
     pub fn list_devices(&self) -> Result<Vec<DeviceRecord>, CradleError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT udid, name, product_type, ios_version, encrypted
              FROM devices ORDER BY last_seen DESC",
         )?;
@@ -285,11 +305,39 @@ impl Catalog {
 
     /// Opens a new run row with `status = 'running'` and returns its id.
     pub fn start_run(&self, udid: &str, kind: RunKind) -> Result<i64, CradleError> {
-        self.conn.execute(
+        // One guard for both calls: `last_insert_rowid` reflects whatever
+        // this connection inserted most recently, so another operation
+        // squeezing in an insert between `execute` and this would return
+        // the wrong id.
+        let conn = self.conn();
+        conn.execute(
             "INSERT INTO runs (udid, kind, started_at, status) VALUES (?1, ?2, ?3, ?4)",
             params![udid, kind.as_str(), now(), RunStatus::Running.as_str()],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Marks every `running` row for `udid` as `failed` — for a caller
+    /// that just acquired [`crate::lock::WorkingSetLock`] for this device
+    /// and can therefore be certain nothing else is actually running
+    /// against it: any `running` row it finds must be left over from a
+    /// process that exited without calling [`Catalog::finish_run`] (a
+    /// crash, a kill, a forced quit), not a real concurrent operation.
+    /// Returns how many rows it closed out, purely for logging — zero is
+    /// the ordinary case.
+    pub fn fail_abandoned_runs(&self, udid: &str) -> Result<u64, CradleError> {
+        let changed = self.conn().execute(
+            "UPDATE runs SET ended_at = ?1, status = ?2, error = ?3
+             WHERE udid = ?4 AND status = ?5",
+            params![
+                now(),
+                RunStatus::Failed.as_str(),
+                "abandoned: process exited without finishing this run",
+                udid,
+                RunStatus::Running.as_str(),
+            ],
+        )?;
+        Ok(changed as u64)
     }
 
     /// Closes out a run: final status, byte/file counts, and an error
@@ -303,12 +351,49 @@ impl Catalog {
         files: u64,
         error: Option<&str>,
     ) -> Result<(), CradleError> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE runs SET ended_at = ?1, status = ?2, bytes = ?3, files = ?4, error = ?5
              WHERE id = ?6",
             params![now(), status.as_str(), bytes as i64, files as i64, error, run_id],
         )?;
         Ok(())
+    }
+
+    /// Atomically closes out a successful backup run and records the
+    /// snapshot it produced — one transaction, not the two separate
+    /// statements [`Catalog::finish_run`] plus [`Catalog::record_snapshot`]
+    /// would be. CODEBASE_ANALYSIS.md: "SQLite completion and snapshot
+    /// creation are separate statements; failed bookkeeping can disagree
+    /// with completed data operations." Without this, a crash between the
+    /// two writes could leave a run marked `succeeded` with no snapshot
+    /// row to show for it — the backup actually completed, but nothing in
+    /// the catalog would know it produced anything restorable.
+    #[allow(clippy::too_many_arguments)] // one field per column across the two rows this writes atomically
+    pub fn finish_run_with_snapshot(
+        &self,
+        run_id: i64,
+        bytes: u64,
+        files: u64,
+        udid: &str,
+        size: u64,
+        ios_version: &str,
+        verified: bool,
+    ) -> Result<i64, CradleError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE runs SET ended_at = ?1, status = ?2, bytes = ?3, files = ?4, error = NULL
+             WHERE id = ?5",
+            params![now(), RunStatus::Succeeded.as_str(), bytes as i64, files as i64, run_id],
+        )?;
+        tx.execute(
+            "INSERT INTO snapshots (udid, run_id, taken_at, size, ios_version, verified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![udid, run_id, now(), size as i64, ios_version, verified.then(now)],
+        )?;
+        let snapshot_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(snapshot_id)
     }
 
     /// Records a snapshot produced by `run_id`. `verified` should reflect
@@ -324,7 +409,9 @@ impl Catalog {
         ios_version: &str,
         verified: bool,
     ) -> Result<i64, CradleError> {
-        self.conn.execute(
+        // See `start_run` for why this is one guard, not two.
+        let conn = self.conn();
+        conn.execute(
             "INSERT INTO snapshots (udid, run_id, taken_at, size, ios_version, verified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -336,12 +423,13 @@ impl Catalog {
                 verified.then(now),
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     /// Runs for `udid`, most recent first.
     pub fn list_runs(&self, udid: &str) -> Result<Vec<RunRecord>, CradleError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT id, udid, kind, started_at, ended_at, status, bytes, files, error
              FROM runs WHERE udid = ?1 ORDER BY started_at DESC",
         )?;
@@ -365,7 +453,8 @@ impl Catalog {
 
     /// Snapshots for `udid`, most recent first.
     pub fn list_snapshots(&self, udid: &str) -> Result<Vec<SnapshotRecord>, CradleError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT id, udid, run_id, taken_at, size, ios_version, verified_at
              FROM snapshots WHERE udid = ?1 ORDER BY taken_at DESC",
         )?;
@@ -387,7 +476,7 @@ impl Catalog {
 
     /// The most recent run for `udid`, if any.
     pub fn latest_run(&self, udid: &str) -> Result<Option<RunRecord>, CradleError> {
-        self.conn
+        self.conn()
             .query_row(
                 "SELECT id, udid, kind, started_at, ended_at, status, bytes, files, error
                  FROM runs WHERE udid = ?1 ORDER BY started_at DESC LIMIT 1",
@@ -418,7 +507,7 @@ impl Catalog {
         &self,
         udid: &str,
     ) -> Result<Option<SnapshotRecord>, CradleError> {
-        self.conn
+        self.conn()
             .query_row(
                 "SELECT id, udid, run_id, taken_at, size, ios_version, verified_at
                  FROM snapshots
@@ -441,8 +530,45 @@ impl Catalog {
             .map_err(CradleError::from)
     }
 
+    /// The most recently taken snapshot for `udid`, verified or not — used
+    /// to find the snapshot a just-supplied password should be checked
+    /// against, without caring yet whether it already passed.
+    pub fn latest_snapshot(&self, udid: &str) -> Result<Option<SnapshotRecord>, CradleError> {
+        self.conn()
+            .query_row(
+                "SELECT id, udid, run_id, taken_at, size, ios_version, verified_at
+                 FROM snapshots WHERE udid = ?1 ORDER BY taken_at DESC LIMIT 1",
+                params![udid],
+                |row| {
+                    Ok(SnapshotRecord {
+                        id: row.get(0)?,
+                        udid: row.get(1)?,
+                        run_id: row.get(2)?,
+                        taken_at: row.get(3)?,
+                        size: row.get(4)?,
+                        ios_version: row.get(5)?,
+                        verified_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(CradleError::from)
+    }
+
+    /// Marks an existing snapshot verified after the fact — for a snapshot
+    /// recorded as `NeedsPassword` whose password Cradle has since been
+    /// given, letting the already-downloaded `Manifest.db` be re-checked
+    /// without a repeat device transfer. A no-op if already verified.
+    pub fn mark_snapshot_verified(&self, snapshot_id: i64) -> Result<(), CradleError> {
+        self.conn().execute(
+            "UPDATE snapshots SET verified_at = ?1 WHERE id = ?2 AND verified_at IS NULL",
+            params![now(), snapshot_id],
+        )?;
+        Ok(())
+    }
+
     /// Registers a new archive destination. `credential_ref` is a Keychain
-    /// account name (see [`crate::keychain::destination_account`]), not a
+    /// account name (see [`crate::keychain::new_destination_account`]), not a
     /// secret.
     pub fn create_destination(
         &self,
@@ -451,11 +577,13 @@ impl Catalog {
         uri: &str,
         credential_ref: &str,
     ) -> Result<i64, CradleError> {
-        self.conn.execute(
+        // See `start_run` for why this is one guard, not two.
+        let conn = self.conn();
+        conn.execute(
             "INSERT INTO destinations (name, kind, uri, credential_ref) VALUES (?1, ?2, ?3, ?4)",
             params![name, kind, uri, credential_ref],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     /// Looks up a destination by its unique name (what the CLI addresses
@@ -464,7 +592,7 @@ impl Catalog {
         &self,
         name: &str,
     ) -> Result<Option<DestinationRecord>, CradleError> {
-        self.conn
+        self.conn()
             .query_row(
                 "SELECT id, name, kind, uri, credential_ref, retention_json
                  FROM destinations WHERE name = ?1",
@@ -481,17 +609,31 @@ impl Catalog {
     /// Callers are expected to also delete the Keychain-stored password
     /// (this doesn't do that itself, since credential deletion goes
     /// through `keychain.rs`, not the catalog).
+    ///
+    /// Also removes this destination's own `archives` rows first, in the
+    /// same transaction — every real destination has archived at least one
+    /// snapshot to it by the time anyone wants to remove it, and
+    /// `archives.destination_id` is a foreign key with no `ON DELETE`
+    /// clause, so deleting the destination alone fails outright ("FOREIGN
+    /// KEY constraint failed") rather than removing it. Those rows are
+    /// only Cradle's local record of *which* snapshot went where and under
+    /// what restic id — not the archived data itself, which this doesn't
+    /// touch — so dropping them is exactly as harmless as the doc above
+    /// already promises the destination row's own removal is.
     pub fn delete_destination(&self, id: i64) -> Result<(), CradleError> {
-        self.conn
-            .execute("DELETE FROM destinations WHERE id = ?1", params![id])?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM archives WHERE destination_id = ?1", params![id])?;
+        tx.execute("DELETE FROM destinations WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
     /// All configured destinations.
     pub fn list_destinations(&self) -> Result<Vec<DestinationRecord>, CradleError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, name, kind, uri, credential_ref, retention_json FROM destinations ORDER BY name")?;
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT id, name, kind, uri, credential_ref, retention_json FROM destinations ORDER BY name")?;
         let rows = stmt
             .query_map([], Self::map_destination)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -506,7 +648,7 @@ impl Catalog {
         destination_id: i64,
         retention_json: &str,
     ) -> Result<(), CradleError> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE destinations SET retention_json = ?1 WHERE id = ?2",
             params![retention_json, destination_id],
         )?;
@@ -530,7 +672,9 @@ impl Catalog {
         snapshot_id: i64,
         destination_id: i64,
     ) -> Result<i64, CradleError> {
-        self.conn.execute(
+        // See `start_run` for why this is one guard, not two.
+        let conn = self.conn();
+        conn.execute(
             "INSERT INTO archives (snapshot_id, destination_id, state, created_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -540,7 +684,25 @@ impl Catalog {
                 now()
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Same idea as [`Catalog::fail_abandoned_runs`], for archive attempts
+    /// against `snapshot_id` — a caller holding the working-set lock for
+    /// the device that snapshot belongs to can be sure any `pending`
+    /// archive row it finds was abandoned, not concurrent.
+    pub fn fail_abandoned_archives(&self, snapshot_id: i64) -> Result<u64, CradleError> {
+        let changed = self.conn().execute(
+            "UPDATE archives SET state = ?1, error = ?2
+             WHERE snapshot_id = ?3 AND state = ?4",
+            params![
+                ArchiveState::Failed.as_str(),
+                "abandoned: process exited without finishing this archive",
+                snapshot_id,
+                ArchiveState::Pending.as_str(),
+            ],
+        )?;
+        Ok(changed as u64)
     }
 
     /// Closes out an archive attempt. A successful restic backup is taken
@@ -558,7 +720,7 @@ impl Catalog {
         error: Option<&str>,
     ) -> Result<(), CradleError> {
         let verified_at = (state == ArchiveState::Succeeded).then(now);
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE archives SET state = ?1, restic_id = ?2, verified_at = ?3, error = ?4
              WHERE id = ?5",
             params![state.as_str(), restic_id, verified_at, error, archive_id],
@@ -571,7 +733,8 @@ impl Catalog {
         &self,
         snapshot_id: i64,
     ) -> Result<Vec<ArchiveRecord>, CradleError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT id, snapshot_id, destination_id, restic_id, state, created_at, verified_at, error
              FROM archives WHERE snapshot_id = ?1 ORDER BY created_at DESC",
         )?;
@@ -602,7 +765,7 @@ mod tests {
         // directly rather than needing a temp-file dance.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
-        Catalog { conn }
+        Catalog { conn: Mutex::new(conn) }
     }
 
     fn device(udid: &str) -> DeviceRecord {
@@ -649,6 +812,57 @@ mod tests {
     }
 
     #[test]
+    fn fail_abandoned_runs_closes_out_a_stuck_running_row() {
+        let cat = open_temp();
+        cat.upsert_device(&device("udid-1")).unwrap();
+        let run_id = cat.start_run("udid-1", RunKind::Backup).unwrap();
+        // Simulates a process that crashed mid-run: never calls finish_run.
+
+        let changed = cat.fail_abandoned_runs("udid-1").unwrap();
+        assert_eq!(changed, 1);
+
+        let latest = cat.latest_run("udid-1").unwrap().unwrap();
+        assert_eq!(latest.id, run_id);
+        assert_eq!(latest.status, "failed");
+        assert!(latest.error.as_deref().unwrap().contains("abandoned"));
+    }
+
+    #[test]
+    fn fail_abandoned_runs_leaves_a_completed_run_alone() {
+        let cat = open_temp();
+        cat.upsert_device(&device("udid-1")).unwrap();
+        let run_id = cat.start_run("udid-1", RunKind::Backup).unwrap();
+        cat.finish_run(run_id, RunStatus::Succeeded, 100, 5, None).unwrap();
+
+        let changed = cat.fail_abandoned_runs("udid-1").unwrap();
+        assert_eq!(changed, 0);
+
+        let latest = cat.latest_run("udid-1").unwrap().unwrap();
+        assert_eq!(latest.status, "succeeded");
+    }
+
+    #[test]
+    fn finish_run_with_snapshot_updates_both_in_one_call() {
+        let cat = open_temp();
+        cat.upsert_device(&device("udid-1")).unwrap();
+        let run_id = cat.start_run("udid-1", RunKind::Backup).unwrap();
+
+        let snap_id = cat
+            .finish_run_with_snapshot(run_id, 500, 10, "udid-1", 1_000_000, "26.6.1", true)
+            .unwrap();
+
+        let run = cat.latest_run("udid-1").unwrap().unwrap();
+        assert_eq!(run.status, "succeeded");
+        assert_eq!(run.bytes, Some(500));
+        assert_eq!(run.files, Some(10));
+
+        let snapshots = cat.list_snapshots("udid-1").unwrap();
+        let snap = snapshots.iter().find(|s| s.id == snap_id).unwrap();
+        assert_eq!(snap.run_id, run_id);
+        assert!(snap.verified_at.is_some());
+    }
+
+    #[test]
     fn verified_snapshot_records_verified_at() {
         let cat = open_temp();
         cat.upsert_device(&device("udid-1")).unwrap();
@@ -683,7 +897,7 @@ mod tests {
         cat.upsert_device(&updated).unwrap();
 
         let count: i64 = cat
-            .conn
+            .conn()
             .query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
@@ -711,5 +925,27 @@ mod tests {
 
         assert!(cat.destination_by_name("nas").unwrap().is_none());
         assert!(cat.list_destinations().unwrap().is_empty());
+    }
+
+    /// Real bug: every destination that's actually been used has at least
+    /// one `archives` row referencing it, and that foreign key has no `ON
+    /// DELETE` clause — deleting the destination alone failed outright
+    /// with "FOREIGN KEY constraint failed" instead of removing it.
+    #[test]
+    fn delete_destination_with_archived_snapshots_still_succeeds() {
+        let cat = open_temp();
+        cat.upsert_device(&device("udid-1")).unwrap();
+        let run_id = cat.start_run("udid-1", RunKind::Backup).unwrap();
+        let snap_id = cat
+            .record_snapshot("udid-1", run_id, 1_000_000, "26.6.1", true)
+            .unwrap();
+        let dest_id = cat.create_destination("nas", "nas", "/tmp/repo", "cradle-destination-nas").unwrap();
+        let archive_id = cat.start_archive(snap_id, dest_id).unwrap();
+        cat.finish_archive(archive_id, ArchiveState::Succeeded, Some("abc123"), None).unwrap();
+
+        cat.delete_destination(dest_id).unwrap();
+
+        assert!(cat.destination_by_name("nas").unwrap().is_none());
+        assert!(cat.list_archives_for_snapshot(snap_id).unwrap().is_empty());
     }
 }

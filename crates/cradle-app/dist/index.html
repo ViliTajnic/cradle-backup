@@ -178,6 +178,7 @@
   .result { border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 13px; }
   .result.ok { background: var(--ok-weak); color: var(--ok); }
   .result.bad { background: var(--bad-weak); color: var(--bad); }
+  .result.warn { background: var(--warn-weak); color: var(--warn); }
   .result ul { margin: 6px 0 0; padding-left: 18px; }
   .result .headline { font-weight: 700; margin-bottom: 2px; }
   .result details { margin-top: 8px; }
@@ -198,7 +199,7 @@
   <main>
     <div id="home-view">
       <section class="panel">
-        <h2>Your devices</h2>
+        <h2>Your devices <button id="devices-refresh" class="quiet" style="font-size:12px; padding:2px 8px;">Refresh</button></h2>
         <div id="devices" class="empty">Looking for devices…</div>
       </section>
 
@@ -218,15 +219,35 @@
 
       <section class="panel" id="restore-panel" hidden>
         <h2>Restore — <span id="restore-device-name"></span></h2>
+        <label style="display:flex; align-items:center; gap:6px; font-size:12px; margin-bottom:8px;">
+          <input type="checkbox" id="restore-from-archive-toggle" /> Restore from a saved archive copy instead of this computer's own backup
+        </label>
         <div class="inline-form" style="margin-bottom:10px;">
-          <div>
+          <div id="restore-local-source-row">
             <label class="field-label">Restore backup from</label>
             <select id="restore-source" style="min-width:240px;"></select>
+          </div>
+          <div id="restore-archive-source-row" hidden style="display:flex; gap:12px;">
+            <div>
+              <label class="field-label">Archive destination</label>
+              <select id="restore-archive-destination" style="min-width:160px;"></select>
+            </div>
+            <div>
+              <label class="field-label">Snapshot</label>
+              <select id="restore-archive-snapshot" style="min-width:200px;"></select>
+            </div>
           </div>
           <label style="display:flex; align-items:center; gap:6px; font-size:12px; padding-bottom:7px;">
             <input type="checkbox" id="restore-reboot" checked /> Restart device when done
           </label>
         </div>
+        <details style="margin-bottom:10px;">
+          <summary style="font-size:12px; cursor:pointer;">This backup used a different password than what's stored</summary>
+          <div style="margin-top:6px; max-width:320px;">
+            <label class="field-label">Backup password override</label>
+            <input type="password" id="restore-password-override" style="width:100%;" placeholder="Leave blank to use the stored password" />
+          </div>
+        </details>
         <div id="restore-confirm-area"></div>
         <div class="progress-track"><div id="restore-progress-fill" class="progress-fill"></div></div>
         <div class="stat-grid">
@@ -263,6 +284,7 @@
         <h2>Backup storage location</h2>
         <div style="display:flex; align-items:center; gap:8px;">
           <input id="working-dir" style="flex:1;" />
+          <button id="working-dir-browse" class="quiet">Browse…</button>
           <button id="working-dir-save">Save</button>
         </div>
         <div class="status-line">
@@ -270,6 +292,32 @@
           disk doesn't have enough free space for the device's backup. Leave blank to use the
           default (<code>~/Cradle/working</code>).
         </div>
+      </section>
+
+      <section class="panel">
+        <h2>Restore staging location</h2>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <input id="scratch-dir" style="flex:1;" />
+          <button id="scratch-dir-browse" class="quiet">Browse…</button>
+          <button id="scratch-dir-save">Save</button>
+        </div>
+        <div class="status-line">
+          Where a backup is copied to just before restoring it onto a device — never the backup
+          storage location itself (see above), which restore never touches directly. A full
+          backup can be tens of gigabytes, so point this at whichever drive actually has room if
+          the default fills up your internal disk. Leave blank to use the default
+          (<code>~/Cradle/scratch</code>).
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Local backups</h2>
+        <div class="status-line" style="margin-top:0; margin-bottom:10px;">
+          Every device with a backup currently sitting on this Mac — including ones you've since
+          unplugged, replaced, or sold. Deleting one here only removes its local copy; a device's
+          history stays visible, and any saved copy elsewhere is untouched.
+        </div>
+        <div id="local-backups" class="empty">Loading…</div>
       </section>
 
       <section class="panel">
@@ -330,6 +378,89 @@ function initWorkingDirField() {
   document.getElementById("working-dir-save").onclick = () => {
     localStorage.setItem(WORKING_DIR_KEY, input.value.trim());
   };
+
+  const browseBtn = document.getElementById("working-dir-browse");
+  const dialog = window.__TAURI__?.dialog;
+  if (!dialog) {
+    // Missing only if this page is ever opened outside the real Tauri
+    // shell (e.g. this file served directly for a quick visual check) —
+    // typing the path by hand still works either way.
+    browseBtn.disabled = true;
+    browseBtn.title = "Native folder picker unavailable outside the desktop app";
+    return;
+  }
+  browseBtn.onclick = async () => {
+    try {
+      const selected = await dialog.open({ directory: true, multiple: false, title: "Choose backup storage location" });
+      if (typeof selected === "string") {
+        input.value = selected;
+      }
+    } catch (e) {
+      // A cancelled picker isn't an error worth surfacing; anything else
+      // (e.g. permission denied) is rare enough to just leave the field
+      // as it was rather than build a whole error-display path for it.
+      console.error("folder picker failed:", e);
+    }
+  };
+}
+
+const SCRATCH_DIR_KEY = "cradle.scratchDir";
+
+function getScratchDir() {
+  // Empty string means "let the Rust side use its own default"
+  // (~/Cradle/scratch) — see commands.rs's resolve_scratch_dir.
+  return localStorage.getItem(SCRATCH_DIR_KEY) || "";
+}
+
+function initScratchDirField() {
+  const input = document.getElementById("scratch-dir");
+  input.value = getScratchDir();
+  input.placeholder = "~/Cradle/scratch (default)";
+  document.getElementById("scratch-dir-save").onclick = () => {
+    localStorage.setItem(SCRATCH_DIR_KEY, input.value.trim());
+  };
+
+  const browseBtn = document.getElementById("scratch-dir-browse");
+  const dialog = window.__TAURI__?.dialog;
+  if (!dialog) {
+    browseBtn.disabled = true;
+    browseBtn.title = "Native folder picker unavailable outside the desktop app";
+    return;
+  }
+  browseBtn.onclick = async () => {
+    try {
+      const selected = await dialog.open({ directory: true, multiple: false, title: "Choose restore staging location" });
+      if (typeof selected === "string") {
+        input.value = selected;
+      }
+    } catch (e) {
+      console.error("folder picker failed:", e);
+    }
+  };
+}
+
+// Values embedded in these template-literal innerHTML blocks (paths,
+// restic snapshot ids, error/problem text — anything not a fixed string
+// this file wrote itself) must go through this first: none of it is
+// trusted markup, and CSP alone isn't enabled here to catch a miss
+// (CODEBASE_ANALYSIS.md's innerHTML/CSP finding).
+// Every long-running operation opens or grows a panel below whatever the
+// user was already looking at. `main` scrolls (see CSS) but nothing moved
+// the scroll position to follow it, so on a short window the new panel —
+// or a result appended to the bottom of an existing one — could render
+// entirely off-screen with no visual sign anything happened at all.
+function scrollToPanel(id) {
+  const el = document.getElementById(id);
+  if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function humanBytes(bytes) {
@@ -374,6 +505,7 @@ function setView(view) {
     home.hidden = true;
     advanced.hidden = false;
     toggle.textContent = "Back to devices";
+    loadLocalBackups();
   } else {
     home.hidden = false;
     advanced.hidden = true;
@@ -487,6 +619,32 @@ function buildDeviceCard(d) {
   histBtn.onclick = () => showHistory(d);
   moreMenu.appendChild(histBtn);
 
+  // Re-sends every file instead of trusting the device's own incremental
+  // diff against the last backup — for confirming a backup is genuinely
+  // clean/complete from scratch, not just "nothing looked different to
+  // the device."
+  if (d.reachable) {
+    const fullBackupBtn = document.createElement("button");
+    fullBackupBtn.textContent = "Force full backup";
+    fullBackupBtn.disabled = !d.encryption_enabled;
+    fullBackupBtn.title = d.encryption_enabled
+      ? "Re-transfers everything from scratch instead of only what changed."
+      : "Turn on backup protection first (use Back Up Now).";
+    fullBackupBtn.onclick = () => startBackup(d, true);
+    moreMenu.appendChild(fullBackupBtn);
+  }
+
+  // Always available, not just right after a fresh backup — this is the
+  // same manifest re-check `run_backup`'s "needs_password" banner offers,
+  // exposed as a durable entry point so a wrong or not-yet-entered
+  // password can be fixed without repeating a whole device transfer.
+  if (d.last_backup_at) {
+    const checkPasswordBtn = document.createElement("button");
+    checkPasswordBtn.textContent = "Check backup password";
+    checkPasswordBtn.onclick = () => openCheckPasswordForm(moreMenu, d);
+    moreMenu.appendChild(checkPasswordBtn);
+  }
+
   if (knownDestinations.length) {
     const destSelect = document.createElement("select");
     for (const dest of knownDestinations) {
@@ -514,13 +672,23 @@ function buildDeviceCard(d) {
   return card;
 }
 
+// Guarded against overlap: a slow `list_devices` round trip (a device that
+// stopped responding, say) must not pile up a second call on top of it —
+// CODEBASE_ANALYSIS.md's "Refresh on focus or with a bounded non-overlapping
+// poll."
+let devicesRefreshInFlight = false;
+
 async function refreshDevices() {
+  if (devicesRefreshInFlight) return;
+  devicesRefreshInFlight = true;
   try {
     const devices = await invoke("list_devices");
     lastDevices = devices;
     renderDevices(devices);
   } catch (e) {
     document.getElementById("devices").textContent = "Error: " + e;
+  } finally {
+    devicesRefreshInFlight = false;
   }
 }
 
@@ -602,6 +770,65 @@ function rewireCard(card, device) {
   card.replaceWith(fresh);
 }
 
+// Checks a password against the backup already sitting in the working
+// directory — no device transfer involved, just `Manifest.db` on disk.
+// Toggles a small form inside the "More" menu rather than opening a whole
+// panel, since this is a quick one-off check, not a multi-step flow.
+function openCheckPasswordForm(moreMenu, device) {
+  const existing = moreMenu.querySelector(".check-password-form");
+  if (existing) { existing.remove(); return; }
+
+  const wrap = document.createElement("div");
+  wrap.className = "check-password-form";
+  wrap.style.width = "100%";
+  wrap.style.marginTop = "6px";
+
+  const form = document.createElement("form");
+  form.className = "inline-form";
+  form.style.marginTop = "0";
+  form.innerHTML = `
+    <div style="flex:1; min-width:200px;">
+      <label class="field-label">This device's backup password</label>
+      <input type="password" required autocomplete="current-password" style="width:100%;" />
+    </div>
+    <button type="submit" class="primary">Check</button>
+  `;
+  const passwordInput = form.querySelector("input");
+  const status = document.createElement("div");
+  status.className = "status-line";
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const submitBtn = form.querySelector("button[type=submit]");
+    submitBtn.disabled = true;
+    status.textContent = "Checking against the backup already on disk…";
+    try {
+      const check = await invoke("verify_stored_password", {
+        udid: device.udid,
+        workingDir: getWorkingDir() || null,
+        password: passwordInput.value,
+      });
+      if (check.verified) {
+        status.textContent =
+          `Correct — saved and confirmed against ${check.files} files, ${humanBytes(check.bytes)}. No need to back up again.`;
+        form.remove();
+      } else {
+        status.textContent = "That password didn't match this backup — nothing was saved. " +
+          (check.problems[0] ?? "Try again.");
+        submitBtn.disabled = false;
+      }
+    } catch (err) {
+      status.textContent = "Error: " + err;
+      submitBtn.disabled = false;
+    }
+  });
+
+  wrap.appendChild(form);
+  wrap.appendChild(status);
+  moreMenu.appendChild(wrap);
+  passwordInput.focus();
+}
+
 // ---------- Destinations (Advanced view) ----------
 
 function renderDestinations(destinations) {
@@ -619,7 +846,14 @@ function renderDestinations(destinations) {
   const tbody = document.createElement("tbody");
   for (const d of destinations) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${d.name}</td><td>${d.kind}</td><td>${d.uri}</td>`;
+    // Destination name/kind/uri are user-supplied — text nodes, never
+    // innerHTML, so a crafted value can't inject markup/script into this
+    // webview (CODEBASE_ANALYSIS.md's innerHTML/CSP finding).
+    for (const value of [d.name, d.kind, d.uri]) {
+      const td = document.createElement("td");
+      td.textContent = value;
+      tr.appendChild(td);
+    }
     const actionCell = document.createElement("td");
     actionCell.appendChild(buildRemoveControl(d.name));
     tr.appendChild(actionCell);
@@ -627,6 +861,126 @@ function renderDestinations(destinations) {
   }
   table.appendChild(tbody);
   el.appendChild(table);
+}
+
+// ---------- Local backups (Advanced view) ----------
+
+async function loadLocalBackups() {
+  const el = document.getElementById("local-backups");
+  el.className = "empty";
+  el.textContent = "Loading…";
+  try {
+    const backups = await invoke("list_local_backups", { workingDir: getWorkingDir() || null });
+    renderLocalBackups(backups);
+  } catch (e) {
+    el.className = "";
+    el.textContent = "Error: " + e;
+  }
+}
+
+function renderLocalBackups(backups) {
+  const el = document.getElementById("local-backups");
+  if (!backups.length) {
+    el.className = "empty";
+    el.textContent = "No local backups on this Mac right now.";
+    return;
+  }
+  el.className = "";
+  el.innerHTML = "";
+
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>Device</th><th>Size</th><th>Last backed up</th><th>Saved elsewhere?</th><th></th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  for (const b of backups) {
+    const tr = document.createElement("tr");
+
+    const deviceTd = document.createElement("td");
+    deviceTd.textContent = `${b.name} (${b.product_type}, iOS ${b.ios_version})`;
+    tr.appendChild(deviceTd);
+
+    const sizeTd = document.createElement("td");
+    sizeTd.textContent = b.size_bytes != null ? humanBytes(b.size_bytes) : "—";
+    tr.appendChild(sizeTd);
+
+    const lastTd = document.createElement("td");
+    lastTd.textContent = b.last_backup_at != null ? relativeTime(b.last_backup_at) : "—";
+    tr.appendChild(lastTd);
+
+    const archivedTd = document.createElement("td");
+    archivedTd.textContent = b.archived ? "Yes" : "No";
+    tr.appendChild(archivedTd);
+
+    const actionTd = document.createElement("td");
+    actionTd.appendChild(buildDeleteBackupControl(b));
+    tr.appendChild(actionTd);
+
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  el.appendChild(table);
+}
+
+// Same click-to-confirm pattern as buildRemoveControl (window.confirm() is
+// silently swallowed by Tauri's WKWebView — see that function's own doc).
+// Deleting a backup with no archive anywhere is a one-way door, so that
+// case gets a sharper warning than one that's already safely copied out.
+function buildDeleteBackupControl(backup) {
+  const wrap = document.createElement("span");
+  wrap.style.display = "inline-flex";
+  wrap.style.gap = "6px";
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.textContent = "Delete";
+
+  const renderIdle = () => {
+    wrap.innerHTML = "";
+    wrap.appendChild(deleteBtn);
+  };
+
+  deleteBtn.onclick = () => {
+    wrap.innerHTML = "";
+
+    const warning = document.createElement("span");
+    warning.style.fontSize = "11px";
+    warning.style.color = "var(--warn)";
+    warning.textContent = backup.archived
+      ? "This deletes the local copy only — it's already saved elsewhere. Sure?"
+      : "This backup isn't saved anywhere else — deleting it loses it for good. Sure?";
+
+    const confirmBtn = document.createElement("button");
+    confirmBtn.textContent = "Confirm";
+    confirmBtn.className = "danger-outline";
+    confirmBtn.onclick = async () => {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = "Deleting…";
+      try {
+        await invoke("delete_local_backup", { udid: backup.udid, workingDir: getWorkingDir() || null });
+        await loadLocalBackups();
+      } catch (e) {
+        const errorBox = document.getElementById("local-backups-error") ?? (() => {
+          const box = document.createElement("div");
+          box.id = "local-backups-error";
+          box.className = "result bad";
+          document.getElementById("local-backups").after(box);
+          return box;
+        })();
+        errorBox.hidden = false;
+        errorBox.textContent = "Could not delete this backup: " + e;
+        renderIdle();
+      }
+    };
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.onclick = renderIdle;
+
+    wrap.appendChild(warning);
+    wrap.appendChild(confirmBtn);
+    wrap.appendChild(cancelBtn);
+  };
+
+  renderIdle();
+  return wrap;
 }
 
 // A click-to-confirm control in place of window.confirm(), which Tauri's
@@ -652,7 +1006,7 @@ function buildRemoveControl(name) {
     const warning = document.createElement("span");
     warning.style.fontSize = "11px";
     warning.style.color = "var(--warn)";
-    warning.textContent = "Only forgets it here — the copy itself stays. Sure?";
+    warning.textContent = "Only forgets it here — the copy and its stored password both stay. Sure?";
 
     const confirmBtn = document.createElement("button");
     confirmBtn.textContent = "Confirm";
@@ -661,7 +1015,7 @@ function buildRemoveControl(name) {
       confirmBtn.disabled = true;
       confirmBtn.textContent = "Removing…";
       try {
-        await invoke("remove_destination", { name });
+        await invoke("remove_destination", { name, deleteCredential: false });
         await refreshDestinations();
       } catch (e) {
         const errorBox = document.getElementById("dest-form-error");
@@ -723,6 +1077,7 @@ document.getElementById("add-destination-form").addEventListener("submit", async
 
 function resetArchiveUi(deviceName, destinationName) {
   document.getElementById("archive-panel").hidden = false;
+  scrollToPanel("archive-panel");
   document.getElementById("archive-device-name").textContent = `${deviceName} → ${destinationName}`;
   document.getElementById("archive-progress-fill").style.width = "0%";
   document.getElementById("archive-stat-pct").textContent = "—";
@@ -749,37 +1104,49 @@ async function startArchive(device, destinationName) {
         <div class="headline">Backup copy created.</div>
         ${humanBytes(summary.data_added)} new data written.
         <details><summary>Show details</summary><div>
-          restic snapshot ${summary.snapshot_id} —
+          restic snapshot ${escapeHtml(summary.snapshot_id)} —
           ${humanBytes(summary.total_bytes_processed)} processed, ${summary.total_files_processed} files.
         </div></details>
       </div>`;
     document.getElementById("archive-status").textContent = "Done.";
+    scrollToPanel("archive-result");
   } catch (e) {
-    document.getElementById("archive-result").innerHTML = `<div class="result bad">${e}</div>`;
+    document.getElementById("archive-result").innerHTML = `<div class="result bad">${escapeHtml(e)}</div>`;
     document.getElementById("archive-status").textContent = "Failed.";
+    scrollToPanel("archive-result");
   }
 }
 
 // ---------- Backup ----------
 
-function resetBackupUi(name) {
+function resetBackupUi(name, forceFull) {
   document.getElementById("backup-panel").hidden = false;
-  document.getElementById("backup-device-name").textContent = name;
+  scrollToPanel("backup-panel");
+  document.getElementById("backup-device-name").textContent = forceFull ? `${name} (full)` : name;
   document.getElementById("attention").classList.remove("show");
   document.getElementById("progress-fill").style.width = "0%";
   document.getElementById("stat-pct").textContent = "—";
   document.getElementById("stat-files").textContent = "0";
   document.getElementById("stat-rate").textContent = "—";
   document.getElementById("stat-eta").textContent = "—";
-  document.getElementById("backup-status").textContent = "Starting…";
+  document.getElementById("backup-status").textContent = forceFull ? "Starting a full backup…" : "Starting…";
   document.getElementById("backup-result").innerHTML = "";
   backupStart = performance.now();
 }
 
-async function startBackup(device) {
-  resetBackupUi(device.name ?? "iPhone");
+// `forceFull` re-sends every file instead of trusting the device's own
+// incremental diff against the last backup — for the rare case where
+// something about a prior backup is suspect and only a from-scratch
+// re-transfer will actually confirm the data on disk is clean, not just
+// "the device says nothing changed."
+async function startBackup(device, forceFull = false) {
+  resetBackupUi(device.name ?? "iPhone", forceFull);
   try {
-    const summary = await invoke("run_backup", { udid: device.udid, workingDir: getWorkingDir() || null });
+    const summary = await invoke("run_backup", {
+      udid: device.udid,
+      workingDir: getWorkingDir() || null,
+      forceFull,
+    });
     const result = document.getElementById("backup-result");
     if (summary.verified) {
       result.innerHTML = `
@@ -788,11 +1155,58 @@ async function startBackup(device) {
           <details><summary>Show details</summary><div>
             Verified: ${summary.files} files, ${humanBytes(summary.bytes)}.
             Manifest.db integrity ${summary.manifest_integrity_checked ? "confirmed" : "not checked — no stored backup password"}.
-            <br>${summary.backup_dir}
+            <br>${escapeHtml(summary.backup_dir)}
           </div></details>
         </div>`;
+    } else if (summary.needs_password) {
+      result.innerHTML = `
+        <div class="result warn">
+          <div class="headline">Backup complete — password needed to confirm it.</div>
+          ${summary.files} files, ${humanBytes(summary.bytes)} saved. Cradle doesn't have a
+          stored password for this device, so it couldn't check the backup's integrity.
+        </div>`;
+      const form = document.createElement("form");
+      form.className = "inline-form";
+      form.style.marginTop = "8px";
+      form.innerHTML = `
+        <div style="flex:1; min-width:200px;">
+          <label class="field-label">This device's backup password</label>
+          <input type="password" required style="width:100%;" />
+        </div>
+        <button type="submit" class="primary">Check password</button>
+      `;
+      const passwordInput = form.querySelector("input");
+      const formStatus = document.createElement("div");
+      formStatus.className = "status-line";
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const submitBtn = form.querySelector("button[type=submit]");
+        submitBtn.disabled = true;
+        formStatus.textContent = "Checking against the backup already on disk…";
+        try {
+          const check = await invoke("verify_stored_password", {
+            udid: device.udid,
+            workingDir: getWorkingDir() || null,
+            password: passwordInput.value,
+          });
+          if (check.verified) {
+            formStatus.textContent =
+              `Correct — saved and confirmed against ${check.files} files, ${humanBytes(check.bytes)}. No need to back up again.`;
+            form.remove();
+          } else {
+            formStatus.textContent = "That password didn't match this backup — nothing was saved. " +
+              (check.problems[0] ?? "Try again.");
+            submitBtn.disabled = false;
+          }
+        } catch (err) {
+          formStatus.textContent = "Error: " + err;
+          submitBtn.disabled = false;
+        }
+      });
+      result.appendChild(form);
+      result.appendChild(formStatus);
     } else {
-      const items = summary.problems.map(p => `<li>${p}</li>`).join("");
+      const items = summary.problems.map(p => `<li>${escapeHtml(p)}</li>`).join("");
       result.innerHTML = `
         <div class="result bad">
           <div class="headline">Something went wrong verifying the backup.</div>
@@ -801,14 +1215,16 @@ async function startBackup(device) {
         </div>`;
     }
     document.getElementById("backup-status").textContent = "Done.";
+    scrollToPanel("backup-result");
     refreshDevices();
   } catch (e) {
     document.getElementById("backup-result").innerHTML = `
       <div class="result bad">
         <div class="headline">Backup failed.</div>
-        ${e}
+        ${escapeHtml(e)}
       </div>`;
     document.getElementById("backup-status").textContent = "Failed.";
+    scrollToPanel("backup-result");
   }
 }
 
@@ -823,6 +1239,7 @@ let restoreStart = null;
 // that's cross-device migration onto a new/replacement device.
 async function openRestorePanel(device) {
   document.getElementById("restore-panel").hidden = false;
+  scrollToPanel("restore-panel");
   document.getElementById("restore-device-name").textContent = device.name ?? "iPhone";
   document.getElementById("restore-progress-fill").style.width = "0%";
   document.getElementById("restore-stat-pct").textContent = "—";
@@ -831,6 +1248,7 @@ async function openRestorePanel(device) {
   document.getElementById("restore-stat-eta").textContent = "—";
   document.getElementById("restore-status").textContent = "";
   document.getElementById("restore-result").innerHTML = "";
+  document.getElementById("restore-password-override").value = "";
 
   const select = document.getElementById("restore-source");
   select.innerHTML = "";
@@ -876,7 +1294,95 @@ async function openRestorePanel(device) {
     select.disabled = false;
   }
 
+  setupArchiveRestoreToggle(device);
   buildRestoreConfirm(device, available.length > 0);
+}
+
+// "Restore from an archive" is off by default — most restores are from
+// this computer's own backup, and the archive path needs two more round
+// trips (destinations, then that destination's snapshots) before there's
+// anything to pick.
+function setupArchiveRestoreToggle(device) {
+  const toggle = document.getElementById("restore-from-archive-toggle");
+  const localRow = document.getElementById("restore-local-source-row");
+  const archiveRow = document.getElementById("restore-archive-source-row");
+  toggle.checked = false;
+  localRow.hidden = false;
+  archiveRow.hidden = true;
+
+  toggle.onchange = async () => {
+    localRow.hidden = toggle.checked;
+    archiveRow.hidden = !toggle.checked;
+    if (toggle.checked) {
+      await loadArchiveDestinationsForRestore();
+    }
+    buildRestoreConfirm(device, true);
+  };
+}
+
+async function loadArchiveDestinationsForRestore() {
+  const select = document.getElementById("restore-archive-destination");
+  select.innerHTML = "";
+  try {
+    const destinations = await invoke("list_destinations");
+    if (!destinations.length) {
+      const opt = document.createElement("option");
+      opt.textContent = "No destinations configured";
+      select.appendChild(opt);
+      return;
+    }
+    for (const d of destinations) {
+      const opt = document.createElement("option");
+      opt.value = d.name;
+      opt.textContent = d.name;
+      select.appendChild(opt);
+    }
+    select.onchange = () => loadArchiveSnapshotsForRestore(select.value);
+    await loadArchiveSnapshotsForRestore(select.value);
+  } catch (e) {
+    const opt = document.createElement("option");
+    opt.textContent = "Error: " + e;
+    select.appendChild(opt);
+  }
+}
+
+async function loadArchiveSnapshotsForRestore(destinationName) {
+  const select = document.getElementById("restore-archive-snapshot");
+  select.innerHTML = "";
+  const loading = document.createElement("option");
+  loading.textContent = "Loading snapshots…";
+  select.appendChild(loading);
+  try {
+    const snapshots = await invoke("list_archive_snapshots", { destination: destinationName });
+    select.innerHTML = "";
+    if (!snapshots.length) {
+      const opt = document.createElement("option");
+      opt.textContent = "No snapshots in this destination";
+      select.appendChild(opt);
+      return;
+    }
+    // Most recent first — restic doesn't guarantee an order of its own.
+    for (const s of [...snapshots].reverse()) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      // A destination usually holds more than one device's history in the
+      // same repository — labeling each entry by source device is what
+      // actually makes "pick a specific backup" possible instead of a
+      // list of bare timestamps nobody can tell apart.
+      const who = s.source_name || s.source_udid || "unknown device";
+      const when = (() => {
+        const parsed = new Date(s.time);
+        return Number.isNaN(parsed.getTime()) ? s.time : parsed.toLocaleString();
+      })();
+      opt.textContent = `${who} — ${when} (${s.short_id})`;
+      select.appendChild(opt);
+    }
+  } catch (e) {
+    select.innerHTML = "";
+    const opt = document.createElement("option");
+    opt.textContent = "Error: " + e;
+    select.appendChild(opt);
+  }
 }
 
 // Click-to-confirm, same pattern as buildRemoveControl and for the same
@@ -897,6 +1403,7 @@ function buildRestoreConfirm(device, enabled) {
   };
 
   startBtn.onclick = () => {
+    const fromArchive = document.getElementById("restore-from-archive-toggle").checked;
     const sourceUdid = document.getElementById("restore-source").value;
     area.innerHTML = "";
 
@@ -904,9 +1411,9 @@ function buildRestoreConfirm(device, enabled) {
     warning.className = "result bad";
     warning.style.marginBottom = "8px";
     warning.textContent =
-      sourceUdid === device.udid
+      !fromArchive && sourceUdid === device.udid
         ? "This erases everything currently on the device and replaces it with the selected backup. Continue?"
-        : "This erases everything currently on the target device and replaces it with the other device's backup. Continue?";
+        : "This erases everything currently on the target device and replaces it with the selected backup. Continue?";
 
     const confirmBtn = document.createElement("button");
     confirmBtn.textContent = "Confirm Restore";
@@ -926,24 +1433,42 @@ function buildRestoreConfirm(device, enabled) {
 }
 
 async function startRestore(device) {
-  const sourceUdid = document.getElementById("restore-source").value;
+  const fromArchive = document.getElementById("restore-from-archive-toggle").checked;
+  // Required by the Tauri command's signature either way; ignored on the
+  // archive path (`fromArchive`/`resticSnapshot` take over there), so the
+  // device's own udid is a harmless placeholder when nothing's been
+  // picked from the (hidden) local-source select.
+  const sourceUdid = document.getElementById("restore-source").value || device.udid;
   const reboot = document.getElementById("restore-reboot").checked;
+  const passwordOverride = document.getElementById("restore-password-override").value;
   document.getElementById("restore-confirm-area").innerHTML = "";
   document.getElementById("restore-status").textContent = "Starting…";
   document.getElementById("restore-result").innerHTML = "";
+  scrollToPanel("restore-status");
   restoreStart = performance.now();
   try {
     const summary = await invoke("run_restore", {
       udid: device.udid,
       sourceUdid,
       workingDir: getWorkingDir() || null,
+      scratchDir: getScratchDir() || null,
       reboot,
       systemFiles: false,
+      fromArchive: fromArchive ? document.getElementById("restore-archive-destination").value : null,
+      resticSnapshot: fromArchive ? document.getElementById("restore-archive-snapshot").value : null,
+      passwordOverride: passwordOverride || null,
     });
     document.getElementById("restore-result").innerHTML = `
       <div class="result ok">
         <div class="headline">Restore complete.</div>
-        ${summary.rebooted ? "The device will restart now." : ""}
+        ${summary.rebooted ? "The device will restart now. " : ""}
+        Only Apple's own apps show up right away — that's normal. Backups don't contain app
+        binaries, only their data; once the device is connected to Wi-Fi and signed into the
+        same Apple ID, iOS re-downloads every third-party app automatically and reattaches its
+        restored data. On a device that doesn't already have Wi-Fi set up (a factory-reset or
+        new one), you'll need to connect it to a network yourself first — Cradle doesn't restore
+        network/account settings, on purpose, since overwriting them risks a mismatch with the
+        device's own activation state.
       </div>`;
     document.getElementById("restore-status").textContent = "Done.";
     refreshDevices();
@@ -951,16 +1476,18 @@ async function startRestore(device) {
     document.getElementById("restore-result").innerHTML = `
       <div class="result bad">
         <div class="headline">Restore failed.</div>
-        ${e}
+        ${escapeHtml(e)}
       </div>`;
     document.getElementById("restore-status").textContent = "Failed.";
   }
+  scrollToPanel("restore-result");
 }
 
 // ---------- History ----------
 
 async function showHistory(device) {
   document.getElementById("history-panel").hidden = false;
+  scrollToPanel("history-panel");
   document.getElementById("history-device-name").textContent = device.name ?? "iPhone";
   const el = document.getElementById("history");
   try {
@@ -978,7 +1505,7 @@ async function showHistory(device) {
         <td>${new Date(r.started_at * 1000).toLocaleString()}</td>
         <td>${r.bytes != null ? humanBytes(r.bytes) : "—"}</td>
         <td>${r.files ?? "—"}</td>
-        <td>${r.error ?? ""}</td>
+        <td>${escapeHtml(r.error ?? "")}</td>
       </tr>`).join("");
     el.innerHTML = `<table><thead><tr><th>Kind</th><th>Status</th><th>Started</th><th>Bytes</th><th>Files</th><th>Error</th></tr></thead><tbody>${rows}</tbody></table>`;
   } catch (e) {
@@ -1023,6 +1550,20 @@ listen("backup-status", (event) => {
 
 listen("restore-status", (event) => {
   document.getElementById("restore-status").textContent = event.payload;
+  // Restore has two very differently-paced phases sharing one progress
+  // bar — a local/archive copy, then the on-device transfer. Without
+  // this, the stats left over from the copy phase (100%, its file count,
+  // its rate) just sit there — looking exactly like "done" — for however
+  // long it takes the device transfer to report its own first progress
+  // event, while the status line underneath already says "Restoring...".
+  if (event.payload === "Restoring...") {
+    restoreStart = performance.now();
+    document.getElementById("restore-progress-fill").style.width = "0%";
+    document.getElementById("restore-stat-pct").textContent = "—";
+    document.getElementById("restore-stat-files").textContent = "0";
+    document.getElementById("restore-stat-rate").textContent = "—";
+    document.getElementById("restore-stat-eta").textContent = "—";
+  }
 });
 
 listen("backup-retry", (event) => {
@@ -1038,7 +1579,28 @@ listen("backup-retry", (event) => {
 
 setView("home");
 initWorkingDirField();
+initScratchDirField();
 refreshDevices();
+
+// Discovery wasn't otherwise refreshed after launch — plugging a device in
+// after the app was already open left the empty-state screen unchanged
+// until some other action happened to re-render it.
+// CODEBASE_ANALYSIS.md: "There is no periodic discovery or explicit
+// Refresh button." `refreshDevices` itself is overlap-guarded, so neither
+// of these can pile up on top of a slow one.
+//
+// `refreshAutomatically` skips while a device card has an open inline form
+// (the "set a backup password first" step) — `renderDevices` fully rebuilds
+// every card, so an unconditional automatic refresh would silently wipe out
+// whatever the user was mid-typing there. The manual button bypasses this
+// check: an explicit click is allowed to do that.
+function refreshAutomatically() {
+  if (document.querySelector("#devices form")) return;
+  refreshDevices();
+}
+document.getElementById("devices-refresh").onclick = refreshDevices;
+window.addEventListener("focus", refreshAutomatically);
+setInterval(refreshAutomatically, 5000);
 refreshDestinations();
 </script>
 </body>

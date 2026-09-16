@@ -6,6 +6,7 @@
 //! free, unconditional, forever (non-negotiable #1) — nothing on the
 //! `run_restore` path below checks a license or calls out to a server.
 
+mod json;
 mod progress;
 
 use std::path::{Path, PathBuf};
@@ -13,11 +14,10 @@ use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use cradle_core::CradleError;
-use cradle_core::catalog::{ArchiveState, Catalog, DestinationRecord, DeviceRecord, RunKind, RunStatus};
+use cradle_core::catalog::{Catalog, DestinationRecord, RunKind, RunStatus};
 use cradle_core::crypto::Keybag;
 use cradle_core::power::SleepGuard;
-use cradle_core::{archive, backup, device, keychain, precheck, restore, verify};
+use cradle_core::{archive, backup, keychain, libimobiledevice, precheck, restore, verify, workflow};
 
 use progress::{TerminalProgress, human_bytes};
 
@@ -28,6 +28,16 @@ struct Cli {
     /// (e.g. `~/Library/Application Support/Cradle/catalog.db` on macOS).
     #[arg(long, global = true)]
     catalog: Option<PathBuf>,
+
+    /// Print one JSON object to stdout instead of human-readable text —
+    /// `devices`, `history`, `backup`, `archive run`, `restore`, and
+    /// `doctor` support this. Progress still streams to stderr as plain
+    /// text either way (see `progress.rs`), so a script can capture
+    /// stdout alone and still let a human watch stderr scroll by.
+    /// CODEBASE_ANALYSIS.md: "Add structured JSON results/events and
+    /// stable error categories."
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -44,8 +54,10 @@ enum Command {
         udid: Option<String>,
         /// Canonical working directory root; `<root>/<UDID>/` is used underneath it.
         /// Never point this at a network mount or an archive.
-        #[arg(long, default_value = "working")]
-        working_dir: PathBuf,
+        /// Defaults to the same location the desktop app uses
+        /// (`~/Cradle/working`) when omitted.
+        #[arg(long)]
+        working_dir: Option<PathBuf>,
         /// Force a full backup instead of letting the device compute an incremental.
         #[arg(long)]
         full: bool,
@@ -95,12 +107,16 @@ enum Command {
         restic_snapshot: Option<String>,
         /// Where the local backup lives, when not restoring from an
         /// archive. Must match what `cradle backup` used.
-        #[arg(long, default_value = "working")]
-        working_dir: PathBuf,
+        /// Defaults to the same location the desktop app uses
+        /// (`~/Cradle/working`) when omitted.
+        #[arg(long)]
+        working_dir: Option<PathBuf>,
         /// Staging area the restore is run from — never the working
         /// directory itself (see CLAUDE.md's architecture rule).
-        #[arg(long, default_value = "scratch")]
-        scratch_dir: PathBuf,
+        /// Defaults to the same location the desktop app uses
+        /// (`~/Cradle/scratch`) when omitted.
+        #[arg(long)]
+        scratch_dir: Option<PathBuf>,
         /// Don't reboot the target device once the restore finishes.
         #[arg(long)]
         no_reboot: bool,
@@ -108,6 +124,16 @@ enum Command {
         /// `idevicebackup2 restore`'s own default).
         #[arg(long)]
         system_files: bool,
+        /// The source backup's password, if it's not (or is no longer)
+        /// what's stored in the Keychain for it — e.g. restoring an
+        /// archive made before a later `cradle password set` changed
+        /// what's on file. Overrides the stored password rather than
+        /// replacing it; nothing here touches the Keychain. Per
+        /// CLAUDE.md's non-negotiable #1, restore must stay possible even
+        /// after Cradle's own stored copy no longer matches — this is
+        /// that path.
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Manage a device's backup encryption password.
     ///
@@ -132,8 +158,10 @@ enum Command {
         #[arg(long)]
         udid: Option<String>,
         /// Where the backup lives; `<root>/<UDID>/` is read underneath it.
-        #[arg(long, default_value = "working")]
-        working_dir: PathBuf,
+        /// Defaults to the same location the desktop app uses
+        /// (`~/Cradle/working`) when omitted.
+        #[arg(long)]
+        working_dir: Option<PathBuf>,
         /// Path (relative to the backup root) to the encrypted file.
         #[arg(long)]
         input: PathBuf,
@@ -144,6 +172,12 @@ enum Command {
         /// `Manifest.db`'s `Files.file` blob's `EncryptionKey` field.
         #[arg(long)]
         encryption_key: String,
+        /// This backup's password, if it's not (or is no longer) what's
+        /// stored in the Keychain for this device — see `restore`'s own
+        /// `--password` for why. Overrides the stored password rather
+        /// than replacing it.
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Print a shell completion script to stdout.
     ///
@@ -151,6 +185,12 @@ enum Command {
     /// `fpath` and `compinit` run), or `cradle completions bash | sudo tee
     /// /etc/bash_completion.d/cradle`.
     Completions { shell: Shell },
+    /// Checks that Cradle's actual dependencies are in place: the
+    /// libimobiledevice tools, restic, `usbmuxd` reachability, and the
+    /// default working/scratch/catalog locations — sanitized output safe
+    /// to paste into a bug report. CODEBASE_ANALYSIS.md: "Diagnostic
+    /// command and portable logs."
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -191,8 +231,10 @@ enum PasswordCommand {
         password: Option<String>,
         /// Scratch directory the protocol call needs to be pointed at.
         /// No backup files are written here for this operation.
-        #[arg(long, default_value = "working")]
-        working_dir: PathBuf,
+        /// Defaults to the same location the desktop app uses
+        /// (`~/Cradle/working`) when omitted.
+        #[arg(long)]
+        working_dir: Option<PathBuf>,
     },
 }
 
@@ -219,17 +261,47 @@ enum DestinationCommand {
     },
     /// List configured destinations.
     List,
-    /// Forgets a destination — removes it from the catalog and deletes
-    /// its Keychain-stored password.
-    ///
-    /// Does *not* touch the restic repository itself; the actual backed-up
-    /// data at its URI is untouched. But since Cradle generated and only
-    /// Cradle stored that repository's password, removing the destination
-    /// means Cradle can no longer archive to or read from it unless you
-    /// have the password recorded elsewhere.
+    /// Forgets a destination — removes it from the catalog. Keeps its
+    /// Keychain-stored password by default (pass `--delete-credential` to
+    /// also delete it) — since Cradle generated that password and it's
+    /// the only copy, deleting it makes the repository's existing data
+    /// permanently unreadable, even though the bytes at its URI are
+    /// otherwise untouched. Use `cradle destination connect` to bring a
+    /// forgotten (but not credential-deleted) destination back.
     Remove {
         #[arg(long)]
         name: String,
+        /// Also delete the Keychain-stored password — only pass this if
+        /// you're certain you'll never need this repository again, or
+        /// have its password recorded elsewhere.
+        #[arg(long)]
+        delete_credential: bool,
+    },
+    /// Prints a destination's repository password so it can be written
+    /// down or stored somewhere durable (a password manager, printed
+    /// recovery sheet, ...) — the closest thing to a recovery-kit export
+    /// today. Anyone with this password and the destination's `uri` can
+    /// read and modify that restic repository.
+    ShowPassword {
+        #[arg(long)]
+        name: String,
+    },
+    /// Registers a destination pointing at a repository that already
+    /// exists — recovering a destination after its Keychain credential
+    /// was deleted, or setting Cradle up on a fresh Mac against archives
+    /// made elsewhere. `--password` is validated by actually opening the
+    /// repository before anything is stored; a wrong password fails
+    /// clearly rather than silently recording a destination Cradle can
+    /// never use.
+    Connect {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "local")]
+        kind: String,
+        #[arg(long)]
+        uri: String,
+        #[arg(long)]
+        password: String,
     },
 }
 
@@ -246,8 +318,10 @@ enum ArchiveCommand {
         /// Must match the `--working-dir` the snapshot was backed up
         /// into — the catalog doesn't store a path, only that one
         /// canonical `<root>/<UDID>/` convention (see CLAUDE.md).
-        #[arg(long, default_value = "working")]
-        working_dir: PathBuf,
+        /// Defaults to the same location the desktop app uses
+        /// (`~/Cradle/working`) when omitted.
+        #[arg(long)]
+        working_dir: Option<PathBuf>,
     },
     /// Lists snapshots actually stored at a destination's repository
     /// (restic's own view, not the local catalog's `archives` table).
@@ -276,14 +350,32 @@ enum ArchiveCommand {
         /// Keep the most recent snapshot from each of the last N months.
         #[arg(long)]
         keep_monthly: Option<u32>,
+        /// Show which snapshots this policy would keep and remove without
+        /// actually removing anything. CODEBASE_ANALYSIS.md's "Retention
+        /// preview."
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Runs a full repository integrity check. Heavier than the
-    /// integrity restic already confirms during every `archive run` —
-    /// see `archive::check`'s doc comment.
+    /// Checks a repository's integrity. Heavier than the integrity restic
+    /// already confirms during every `archive run` — see
+    /// `archive::check`'s doc comment. By default this only checks
+    /// structure (fast) — pass `--full` or `--sample` to actually read
+    /// pack contents; see each flag's own help for the difference.
     Check {
         /// Destination name (see `cradle destination list`).
         #[arg(long)]
         destination: String,
+        /// Read and checksum every byte in the repository, not just its
+        /// structure — can take as long as the original archive did.
+        /// Mutually exclusive with `--sample`.
+        #[arg(long, conflicts_with = "sample")]
+        full: bool,
+        /// Read and checksum a random N% sample of the repository instead
+        /// of everything — catches the same silent storage-level
+        /// corruption `--full` does, much faster. Mutually exclusive with
+        /// `--full`.
+        #[arg(long, value_name = "PERCENT")]
+        sample: Option<u8>,
     },
 }
 
@@ -299,28 +391,39 @@ async fn main() -> anyhow::Result<()> {
     // before the catalog path (below) is resolved — no reason for it to
     // depend on, or fail because of, something it has nothing to do with.
     let Command::Completions { shell } = cli.command else {
-        return run_command(cli).await;
+        // Raced against a signal listener for the whole rest of the
+        // command: see `signals.rs` for why — a killed `cradle` process
+        // must not leave an orphaned `idevicebackup2`/`restic` behind
+        // with the working-set lock it held already released.
+        return tokio::select! {
+            result = run_command(cli) => result,
+            _ = cradle_core::signals::wait_and_propagate_termination() => unreachable!(),
+        };
     };
     clap_complete::generate(shell, &mut Cli::command(), "cradle", &mut std::io::stdout());
     Ok(())
 }
 
 async fn run_command(cli: Cli) -> anyhow::Result<()> {
+    let json = cli.json;
     let catalog_path = match cli.catalog {
         Some(path) => path,
         None => Catalog::default_path()?,
     };
 
     match cli.command {
-        Command::Devices => run_devices().await,
+        Command::Devices => run_devices(json).await,
         Command::Backup {
             udid,
             working_dir,
             full,
-        } => run_backup(udid, working_dir, full, catalog_path).await,
-        Command::History { udid } => run_history(udid, catalog_path),
+        } => {
+            let working_dir = working_dir.unwrap_or_else(cradle_core::paths::default_working_dir);
+            run_backup(udid, working_dir, full, catalog_path, json).await
+        }
+        Command::History { udid } => run_history(udid, catalog_path, json),
         Command::Destination { command } => run_destination(command, catalog_path).await,
-        Command::Archive { command } => run_archive(command, catalog_path).await,
+        Command::Archive { command } => run_archive(command, catalog_path, json).await,
         Command::Restore {
             udid,
             source_udid,
@@ -330,7 +433,10 @@ async fn run_command(cli: Cli) -> anyhow::Result<()> {
             scratch_dir,
             no_reboot,
             system_files,
+            password,
         } => {
+            let working_dir = working_dir.unwrap_or_else(cradle_core::paths::default_working_dir);
+            let scratch_dir = scratch_dir.unwrap_or_else(cradle_core::paths::default_scratch_dir);
             run_restore(
                 udid,
                 source_udid,
@@ -340,7 +446,9 @@ async fn run_command(cli: Cli) -> anyhow::Result<()> {
                 scratch_dir,
                 no_reboot,
                 system_files,
+                password,
                 catalog_path,
+                json,
             )
             .await
         }
@@ -351,19 +459,53 @@ async fn run_command(cli: Cli) -> anyhow::Result<()> {
             input,
             output,
             encryption_key,
-        } => run_decrypt(udid, working_dir, input, output, encryption_key).await,
+            password,
+        } => {
+            let working_dir = working_dir.unwrap_or_else(cradle_core::paths::default_working_dir);
+            run_decrypt(udid, working_dir, input, output, encryption_key, password).await
+        }
         // Handled in `main` before `run_command` is ever called.
         Command::Completions { .. } => unreachable!(),
+        Command::Doctor => run_doctor(catalog_path, json).await,
     }
 }
 
-async fn run_devices() -> anyhow::Result<()> {
-    let devices = device::list().await?;
+#[derive(serde::Serialize)]
+struct JsonDevice {
+    udid: String,
+    transport: String,
+    name: Option<String>,
+    product_type: Option<String>,
+    ios_version: Option<String>,
+    reachable: bool,
+    pairing_error: Option<String>,
+}
+
+async fn run_devices(json: bool) -> anyhow::Result<()> {
+    let devices = libimobiledevice::list_devices().await?;
+
+    if json {
+        let mut out = Vec::with_capacity(devices.len());
+        for attached in devices {
+            let info = libimobiledevice::device_info(&attached.udid).await;
+            out.push(JsonDevice {
+                udid: attached.udid,
+                transport: format!("{:?}", attached.transport),
+                name: info.as_ref().ok().map(|i| i.name.clone()),
+                product_type: info.as_ref().ok().map(|i| i.product_type.clone()),
+                ios_version: info.as_ref().ok().map(|i| i.ios_version.clone()),
+                reachable: info.is_ok(),
+                pairing_error: info.err().map(|e| e.to_string()),
+            });
+        }
+        crate::json::print_ok(out);
+        return Ok(());
+    }
+
     if devices.is_empty() {
         println!("No devices attached.");
         return Ok(());
     }
-
     for attached in devices {
         print!("{}\t{:?}", attached.udid, attached.transport);
         match describe(&attached.udid).await {
@@ -375,18 +517,99 @@ async fn run_devices() -> anyhow::Result<()> {
 }
 
 async fn describe(udid: &str) -> anyhow::Result<String> {
-    let info = device::info(udid).await?;
+    let info = libimobiledevice::device_info(udid).await?;
     Ok(format!(
         "{} ({}, iOS {})",
         info.name, info.product_type, info.ios_version
     ))
 }
 
+#[derive(serde::Serialize)]
+struct DoctorCheck {
+    label: String,
+    ok: bool,
+    detail: String,
+}
+
+/// Checks that Cradle's actual runtime dependencies are in place — safe to
+/// paste into a bug report as-is (text or `--json`), since nothing here
+/// prints a password, a Keychain value, or file contents. Never fails the
+/// process on its own checks failing: a missing tool is exactly the kind
+/// of thing this command exists to surface, not to error out on — the
+/// exit code still reflects it at the end (see the `!ok` check below).
+async fn run_doctor(catalog_path: PathBuf, json: bool) -> anyhow::Result<()> {
+    let mut checks = Vec::new();
+    let mut check = |label: String, result: Result<String, String>| {
+        let (ok, detail) = match result {
+            Ok(detail) => (true, detail),
+            Err(reason) => (false, reason),
+        };
+        checks.push(DoctorCheck { label, ok, detail });
+    };
+
+    for tool in ["idevice_id", "ideviceinfo", "idevicepair", "idevicebackup2"] {
+        check(
+            tool.to_string(),
+            cradle_core::tools::resolve(tool)
+                .map(|p| p.display().to_string())
+                .map_err(|e| e.to_string()),
+        );
+    }
+    check(
+        "restic".to_string(),
+        cradle_core::tools::resolve("restic")
+            .map(|p| p.display().to_string())
+            .map_err(|e| format!("{e} (try `brew install restic`)")),
+    );
+
+    match libimobiledevice::list_devices().await {
+        Ok(devices) => check(
+            "usbmuxd".to_string(),
+            Ok(format!("reachable, {} device(s) currently seen", devices.len())),
+        ),
+        Err(e) => check("usbmuxd".to_string(), Err(e.to_string())),
+    }
+
+    for (label, dir) in [
+        ("working directory", cradle_core::paths::default_working_dir()),
+        ("scratch directory", cradle_core::paths::default_scratch_dir()),
+    ] {
+        let free = precheck::free_disk_space(&dir);
+        check(
+            format!("{label} ({})", dir.display()),
+            match free {
+                Some(bytes) => Ok(format!("{} free", human_bytes(bytes))),
+                None => Err("could not measure free space — is its volume mounted?".to_string()),
+            },
+        );
+    }
+
+    check(
+        format!("catalog ({})", catalog_path.display()),
+        Catalog::open(&catalog_path).map(|_| "opens fine".to_string()).map_err(|e| e.to_string()),
+    );
+
+    let all_ok = checks.iter().all(|c| c.ok);
+    if json {
+        crate::json::print_ok(checks);
+    } else {
+        for c in &checks {
+            let tag = if c.ok { "[ok]  " } else { "[FAIL]" };
+            println!("{tag} {}: {}", c.label, c.detail);
+        }
+    }
+
+    if !all_ok {
+        anyhow::bail!("One or more checks failed.");
+    }
+    Ok(())
+}
+
 async fn resolve_udid(udid: Option<String>) -> anyhow::Result<String> {
     if let Some(udid) = udid {
         return Ok(udid);
     }
-    let devices = device::list().await?;
+    let devices = libimobiledevice::list_devices().await?;
     match devices.as_slice() {
         [only] => Ok(only.udid.clone()),
         [] => anyhow::bail!("No devices attached. Connect an iPhone or iPad and unlock it."),
@@ -394,11 +617,23 @@ async fn resolve_udid(udid: Option<String>) -> anyhow::Result<String> {
     }
 }
 
+#[derive(serde::Serialize)]
+struct BackupJson {
+    backup_dir: String,
+    files: u64,
+    bytes: u64,
+    verified: bool,
+    needs_password: bool,
+    manifest_integrity_checked: bool,
+    problems: Vec<String>,
+}
+
 async fn run_backup(
     udid: Option<String>,
     working_root: PathBuf,
     full: bool,
     catalog_path: PathBuf,
+    json: bool,
 ) -> anyhow::Result<()> {
     // A real ~75GB backup over USB took the better part of an hour and
     // failed near the end with MBErrorDomain 104 ("computer-side errors
@@ -406,207 +641,175 @@ async fn run_backup(
     // transfer during that unattended hour. Held for the whole function.
     let _sleep_guard = SleepGuard::engage();
 
-    let udid = resolve_udid(udid).await?;
-
-    println!("Running prechecks...");
-    let precheck_report = precheck::run(&udid, &working_root).await?;
-
-    if let Some(info) = &precheck_report.device {
-        println!(
-            "Device: {} ({}, iOS {})",
-            info.name, info.product_type, info.ios_version
-        );
-    }
-
-    if !precheck_report.pairing_valid {
-        anyhow::bail!(precheck_report
-            .pairing_message
-            .unwrap_or_else(|| "Pairing check failed.".to_string()));
-    }
-    if !precheck_report.encryption_enabled {
-        anyhow::bail!(
-            "Backup encryption is off on this device. Run `cradle password enable --udid {}` \
-             to turn it on before continuing — without it, Keychain, Health, call history and \
-             saved passwords are silently omitted from the backup.",
-            precheck_report
-                .device
-                .as_ref()
-                .map(|d| d.udid.as_str())
-                .unwrap_or("<udid>")
-        );
-    }
-    if !precheck_report.free_space_ok {
-        anyhow::bail!(
-            "Only {} free on the working volume; want at least {} before starting a backup.",
-            human_bytes(precheck_report.free_space_bytes),
-            human_bytes(precheck::MIN_FREE_BYTES),
-        );
-    }
-    let device_info = precheck_report.device.clone().ok_or_else(|| {
-        anyhow::anyhow!("prechecks passed but returned no device info — this is a bug")
-    })?;
-
-    let catalog = Catalog::open(&catalog_path)?;
-    catalog.upsert_device(&DeviceRecord {
-        udid: device_info.udid.clone(),
-        name: device_info.name.clone(),
-        product_type: device_info.product_type.clone(),
-        ios_version: device_info.ios_version.clone(),
-        encrypted: precheck_report.encryption_enabled,
-    })?;
-    let run_id = catalog.start_run(&udid, RunKind::Backup)?;
-
-    println!("Prechecks passed. Backing up into {}...", working_root.display());
-
+    let udid = resolve_udid(udid).await.map_err(|e| crate::json::bail(json, "device_not_found", e))?;
+    let catalog = Catalog::open(&catalog_path).map_err(|e| crate::json::bail(json, "catalog_error", e))?;
     let progress = Arc::new(TerminalProgress::new());
-    // Error carries (error, bytes_transferred, files_received) so far —
-    // once `outcome` exists it has the real counts `backup::run` measured;
-    // before that, `BackupError`'s own counts (0/0, since nothing moved
-    // yet) cover it. Without this, a run that failed verification or
-    // keychain lookup *after* a real transfer would still land in the
-    // catalog as 0 bytes / 0 files, same bug this whole thing exists to
-    // avoid.
-    let attempt: Result<(backup::Outcome, verify::Report), (CradleError, u64, u64)> = async {
-        let outcome = backup::run_resilient(
-            &udid,
-            &working_root,
-            full,
-            progress.clone(),
-            |reason, attempt, max_attempts| match reason {
-                backup::RetryReason::DeviceLocked => eprintln!(
-                    "\nDevice locked mid-backup — unlock it now. Retrying in {}s (attempt {}/{})...",
-                    backup::LOCK_RETRY_DELAY.as_secs(),
-                    attempt,
-                    max_attempts
-                ),
-                backup::RetryReason::HostIo => eprintln!(
-                    "\nHost-side I/O error (device error 104) — usually low memory on this Mac. \
-                     Retrying in {}s (attempt {}/{})...",
-                    backup::HOST_IO_RETRY_DELAY.as_secs(),
-                    attempt,
-                    max_attempts
-                ),
-                backup::RetryReason::Stalled => eprintln!(
-                    "\nDevice stopped responding, no error reported — check the cable/USB \
-                     connection and that the device is unlocked and awake. Retrying in {}s \
-                     (attempt {}/{})...",
-                    backup::STALL_RETRY_DELAY.as_secs(),
-                    attempt,
-                    max_attempts
-                ),
-            },
-        )
-        .await
-        .map_err(|e| (e.source, e.bytes_transferred, e.files_received))?;
-        progress.finish();
 
-        println!("Verifying backup...");
-        // A stored backup password unlocks the real Manifest.db integrity
-        // check instead of the reduced one — see verify.rs's module doc.
-        // Not finding one is the common case, not an error: nothing here
-        // prompts for it mid-backup.
-        let stored_password = keychain::try_read(&keychain::device_account(&udid))
-            .map_err(|e| (e, outcome.bytes_transferred, outcome.files_received))?;
-        let gate = verify::run(
-            &outcome.backup_dir,
-            outcome.files_received,
-            stored_password.as_deref(),
-        )
-        .await
-        .map_err(|e| (e, outcome.bytes_transferred, outcome.files_received))?;
-        Ok((outcome, gate))
+    if !json {
+        println!("Running prechecks...");
     }
+    let request = workflow::BackupRequest {
+        udid: udid.clone(),
+        working_root: working_root.clone(),
+        full,
+    };
+    let result = workflow::run_backup(
+        catalog,
+        request,
+        progress.clone(),
+        |info| {
+            if !json {
+                println!("Device: {} ({}, iOS {})", info.name, info.product_type, info.ios_version);
+                println!("Prechecks passed. Backing up into {}...", working_root.display());
+            }
+        },
+        move || {
+            if !json {
+                println!("Verifying backup...");
+            }
+        },
+        // Retries always narrate to stderr regardless of --json: they're
+        // progress, not the final result, same reasoning as progress.rs.
+        |reason, attempt, max_attempts| match reason {
+            backup::RetryReason::DeviceLocked => eprintln!(
+                "\nDevice locked mid-backup — unlock it now. Retrying in {}s (attempt {}/{})...",
+                backup::LOCK_RETRY_DELAY.as_secs(),
+                attempt,
+                max_attempts
+            ),
+            backup::RetryReason::HostIo => eprintln!(
+                "\nHost-side I/O error (device error 104) — usually low memory on this Mac. \
+                 Retrying in {}s (attempt {}/{})...",
+                backup::HOST_IO_RETRY_DELAY.as_secs(),
+                attempt,
+                max_attempts
+            ),
+            backup::RetryReason::Stalled => eprintln!(
+                "\nDevice stopped responding, no error reported — check the cable/USB \
+                 connection and that the device is unlocked and awake. Retrying in {}s \
+                 (attempt {}/{})...",
+                backup::STALL_RETRY_DELAY.as_secs(),
+                attempt,
+                max_attempts
+            ),
+        },
+    )
     .await;
+    progress.finish();
 
-    match attempt {
-        Ok((outcome, gate)) if gate.passed() => {
-            catalog.finish_run(
-                run_id,
-                RunStatus::Succeeded,
-                outcome.bytes_transferred,
-                gate.files_on_disk,
-                None,
-            )?;
-            catalog.record_snapshot(
-                &udid,
-                run_id,
-                gate.total_bytes,
-                &device_info.ios_version,
-                true,
-            )?;
-            println!(
-                "Backup verified: {} ({} files, {}, Manifest.db integrity {}).",
-                outcome.backup_dir.display(),
-                gate.files_on_disk,
-                human_bytes(gate.total_bytes),
-                if gate.manifest_integrity_checked {
-                    "confirmed"
-                } else {
-                    "not checked — no stored backup password; see `cradle password set`"
+    match result {
+        Ok(outcome) => {
+            let verified = outcome.gate.outcome == verify::Outcome::Verified;
+            let needs_password = outcome.gate.outcome == verify::Outcome::NeedsPassword;
+            if json {
+                crate::json::print_ok(BackupJson {
+                    backup_dir: outcome.backup_dir.display().to_string(),
+                    files: outcome.gate.files_on_disk,
+                    bytes: outcome.gate.total_bytes,
+                    verified,
+                    needs_password,
+                    manifest_integrity_checked: outcome.gate.manifest_integrity_checked,
+                    problems: outcome.gate.problems.clone(),
+                });
+                if verified || needs_password {
+                    return Ok(());
                 }
-            );
-            Ok(())
+                anyhow::bail!("Backup did not pass verification.");
+            }
+            if verified {
+                println!(
+                    "Backup verified: {} ({} files, {}, Manifest.db integrity confirmed).",
+                    outcome.backup_dir.display(),
+                    outcome.gate.files_on_disk,
+                    human_bytes(outcome.gate.total_bytes),
+                );
+                Ok(())
+            } else if needs_password {
+                println!(
+                    "Backup completed but not verified: {} ({} files, {}). No stored backup \
+                     password — Manifest.db integrity was never checked, so this cannot be \
+                     archived yet. Run `cradle password set` and re-run `cradle backup` to \
+                     verify it.",
+                    outcome.backup_dir.display(),
+                    outcome.gate.files_on_disk,
+                    human_bytes(outcome.gate.total_bytes),
+                );
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "Backup did not pass verification — treat {} as failed, not a usable snapshot:\n{}",
+                    outcome.backup_dir.display(),
+                    outcome.gate.problems.join("\n"),
+                )
+            }
         }
-        Ok((outcome, gate)) => {
-            let problems = gate_problems(&gate);
-            catalog.finish_run(
-                run_id,
-                RunStatus::Failed,
-                outcome.bytes_transferred,
-                gate.files_on_disk,
-                Some(&problems.join(" ")),
-            )?;
-            anyhow::bail!(
-                "Backup did not pass verification — treat {} as failed, not a usable snapshot:\n{}",
-                outcome.backup_dir.display(),
-                problems.join("\n"),
-            );
+        Err(workflow::WorkflowError::NotStarted(workflow::NotStartedReason::Precheck(report))) => {
+            if !json && let Some(info) = &report.device {
+                println!("Device: {} ({}, iOS {})", info.name, info.product_type, info.ios_version);
+            }
+            let (category, message) = if !report.pairing_valid {
+                (
+                    "pairing_invalid",
+                    report.pairing_message.clone().unwrap_or_else(|| "Pairing check failed.".to_string()),
+                )
+            } else if !report.encryption_enabled {
+                (
+                    "encryption_disabled",
+                    format!(
+                        "Backup encryption is off on this device. Run `cradle password enable \
+                         --udid {udid}` to turn it on before continuing — without it, Keychain, \
+                         Health, call history and saved passwords are silently omitted from the \
+                         backup."
+                    ),
+                )
+            } else {
+                match report.free_space_bytes {
+                    Some(bytes) => (
+                        "insufficient_space",
+                        format!(
+                            "Only {} free on the working volume; want at least {} before \
+                             starting a backup.",
+                            human_bytes(bytes),
+                            human_bytes(precheck::MIN_FREE_BYTES),
+                        ),
+                    ),
+                    None => (
+                        "space_unknown",
+                        "Could not measure free space on the working volume — is it mounted? \
+                         (An external drive that's unplugged or asleep looks like this.)"
+                            .to_string(),
+                    ),
+                }
+            };
+            if json {
+                crate::json::print_err(category, &message);
+            }
+            anyhow::bail!(message)
         }
-        Err((e, bytes_transferred, files_received)) => {
-            // Record the failure before propagating it — a run left
-            // "running" forever in the catalog would be its own bug.
-            catalog.finish_run(
-                run_id,
-                RunStatus::Failed,
-                bytes_transferred,
-                files_received,
-                Some(&e.to_string()),
-            )?;
+        Err(e) => {
+            if json {
+                crate::json::print_err("failed", &e);
+            }
             Err(e.into())
         }
     }
 }
 
-fn gate_problems(gate: &verify::Report) -> Vec<String> {
-    let mut problems = Vec::new();
-    if !gate.status_finished {
-        problems.push(
-            "Status.plist does not report a finished snapshot — the device may have cancelled \
-             or the transfer was interrupted."
-                .to_string(),
-        );
-    }
-    if !gate.manifest_present {
-        problems.push(if gate.manifest_integrity_checked {
-            "Manifest.db failed PRAGMA integrity_check after decryption — it's corrupt, not \
-             just incomplete."
-                .to_string()
-        } else {
-            "Manifest.db is missing, empty, or truncated — it did not arrive intact.".to_string()
-        });
-    }
-    if !gate.file_count_match {
-        problems.push(format!(
-            "File count mismatch: {} files on disk vs. {} expected.",
-            gate.files_on_disk, gate.files_expected
-        ));
-    }
-    problems
+#[derive(serde::Serialize)]
+struct HistoryJson {
+    runs: Vec<cradle_core::catalog::RunRecord>,
+    snapshots: Vec<cradle_core::catalog::SnapshotRecord>,
 }
 
-fn run_history(udid: String, catalog_path: PathBuf) -> anyhow::Result<()> {
+fn run_history(udid: String, catalog_path: PathBuf, json: bool) -> anyhow::Result<()> {
     let catalog = Catalog::open(&catalog_path)?;
     let runs = catalog.list_runs(&udid)?;
+
+    if json {
+        let snapshots = catalog.list_snapshots(&udid)?;
+        crate::json::print_ok(HistoryJson { runs, snapshots });
+        return Ok(());
+    }
 
     if runs.is_empty() {
         println!(
@@ -680,7 +883,7 @@ async fn run_destination(command: DestinationCommand, catalog_path: PathBuf) -> 
                 anyhow::bail!("A destination named '{name}' already exists.");
             }
 
-            let credential_ref = keychain::destination_account(&name);
+            let credential_ref = keychain::new_destination_account(&name);
             keychain::generate_and_store(&credential_ref)?;
 
             // A throwaway record (id doesn't matter — archive:: only reads
@@ -728,15 +931,60 @@ async fn run_destination(command: DestinationCommand, catalog_path: PathBuf) -> 
             }
             Ok(())
         }
-        DestinationCommand::Remove { name } => {
+        DestinationCommand::Remove { name, delete_credential } => {
             let destination = resolve_destination(&catalog, &name)?;
             catalog.delete_destination(destination.id)?;
-            let _ = keychain::delete(&destination.credential_ref);
-            println!(
-                "Removed destination '{name}'. The repository at {} is untouched — only \
-                 Cradle's record of it and its stored password are gone.",
-                destination.uri
-            );
+            if delete_credential {
+                let _ = keychain::delete(&destination.credential_ref);
+                println!(
+                    "Removed destination '{name}' and deleted its stored password. The \
+                     repository at {} still has its data, but Cradle can no longer read or \
+                     write it without that password.",
+                    destination.uri
+                );
+            } else {
+                println!(
+                    "Forgot destination '{name}'. Its stored password was kept — run `cradle \
+                     destination connect --name {name} --uri {} --password <password>` (get the \
+                     password first with `cradle destination show-password --name {name}` if \
+                     you still have it, before forgetting again) to bring it back.",
+                    destination.uri
+                );
+            }
+            Ok(())
+        }
+        DestinationCommand::ShowPassword { name } => {
+            let destination = resolve_destination(&catalog, &name)?;
+            let password = keychain::read(&destination.credential_ref)?;
+            println!("{password}");
+            Ok(())
+        }
+        DestinationCommand::Connect { name, kind, uri, password } => {
+            if catalog.destination_by_name(&name)?.is_some() {
+                anyhow::bail!("A destination named '{name}' already exists.");
+            }
+            let credential_ref = keychain::new_destination_account(&name);
+            keychain::store(&credential_ref, &password)?;
+
+            let probe = DestinationRecord {
+                id: 0,
+                name: name.clone(),
+                kind: kind.clone(),
+                uri: uri.clone(),
+                credential_ref: credential_ref.clone(),
+                retention_json: None,
+            };
+            // Actually open the repository with this password before
+            // recording anything — a wrong password must fail here, not
+            // silently produce a destination Cradle can never archive to.
+            println!("Validating password against {uri}...");
+            if let Err(e) = archive::list_snapshots(&probe).await {
+                let _ = keychain::delete(&credential_ref);
+                anyhow::bail!("Could not open the repository at {uri} with that password: {e}");
+            }
+
+            catalog.create_destination(&name, &kind, &uri, &credential_ref)?;
+            println!("Destination '{name}' connected to the existing repository at {uri}.");
             Ok(())
         }
     }
@@ -750,14 +998,20 @@ fn resolve_destination(catalog: &Catalog, name: &str) -> anyhow::Result<Destinat
     })
 }
 
-async fn run_archive(command: ArchiveCommand, catalog_path: PathBuf) -> anyhow::Result<()> {
+async fn run_archive(command: ArchiveCommand, catalog_path: PathBuf, json: bool) -> anyhow::Result<()> {
+    // `Run` opens its own `Catalog` rather than sharing the one below,
+    // because it hands ownership of it to `workflow::run_archive` — that
+    // function holds it across several `.await` points, which needs an
+    // owned `Catalog` to stay `Send` (a `rusqlite::Connection` reference
+    // is not `Sync`, but the connection itself is `Send`).
+    if let ArchiveCommand::Run { udid, destination, working_dir } = command {
+        let working_dir = working_dir.unwrap_or_else(cradle_core::paths::default_working_dir);
+        return run_archive_run(&catalog_path, &udid, &destination, &working_dir, json).await;
+    }
+
     let catalog = Catalog::open(&catalog_path)?;
     match command {
-        ArchiveCommand::Run {
-            udid,
-            destination,
-            working_dir,
-        } => run_archive_run(&catalog, &udid, &destination, &working_dir).await,
+        ArchiveCommand::Run { .. } => unreachable!("handled above"),
         ArchiveCommand::List { destination } => run_archive_list(&catalog, &destination).await,
         ArchiveCommand::Prune {
             destination,
@@ -765,6 +1019,7 @@ async fn run_archive(command: ArchiveCommand, catalog_path: PathBuf) -> anyhow::
             keep_daily,
             keep_weekly,
             keep_monthly,
+            dry_run,
         } => {
             let policy = archive::RetentionPolicy {
                 keep_last,
@@ -772,76 +1027,121 @@ async fn run_archive(command: ArchiveCommand, catalog_path: PathBuf) -> anyhow::
                 keep_weekly,
                 keep_monthly,
             };
-            run_archive_prune(&catalog, &destination, policy).await
+            if dry_run {
+                run_archive_prune_preview(&catalog, &destination, policy).await
+            } else {
+                run_archive_prune(&catalog, &destination, policy).await
+            }
         }
-        ArchiveCommand::Check { destination } => run_archive_check(&catalog, &destination).await,
+        ArchiveCommand::Check { destination, full, sample } => {
+            let mode = match (full, sample) {
+                (true, _) => archive::CheckMode::Full,
+                (false, Some(percent)) => archive::CheckMode::Sample { percent },
+                (false, None) => archive::CheckMode::Quick,
+            };
+            run_archive_check(&catalog, &destination, mode).await
+        }
     }
 }
 
+#[derive(serde::Serialize)]
+struct ArchiveJson {
+    snapshot_id: String,
+    data_added: u64,
+    total_bytes_processed: u64,
+    total_files_processed: u64,
+}
+
 async fn run_archive_run(
-    catalog: &Catalog,
+    catalog_path: &Path,
     udid: &str,
     destination_name: &str,
     working_root: &Path,
+    json: bool,
 ) -> anyhow::Result<()> {
     // See run_backup's own comment — archiving to a NAS/cloud destination
     // is exactly as susceptible to a sleep-induced host I/O failure over a
     // long, unattended run.
     let _sleep_guard = SleepGuard::engage();
 
-    let destination = resolve_destination(catalog, destination_name)?;
-
-    let snapshot = catalog.latest_verified_snapshot(udid)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "No verified snapshot for {udid} yet — run `cradle backup --udid {udid}` first. Per \
-             CLAUDE.md, an unverified backup is never treated as an archivable snapshot."
-        )
-    })?;
-
-    let source_dir = working_root.join(udid);
-    if !source_dir.is_dir() {
-        anyhow::bail!(
-            "Catalog has a verified snapshot for {udid}, but {} doesn't exist. Did --working-dir \
-             change since that backup ran?",
-            source_dir.display()
-        );
-    }
-
-    archive::ensure_initialized(&destination).await?;
-    let archive_id = catalog.start_archive(snapshot.id, destination.id)?;
-
-    println!(
-        "Archiving {} to '{}' ({})...",
-        source_dir.display(),
-        destination.name,
-        destination.uri
-    );
+    let catalog = Catalog::open(catalog_path).map_err(|e| crate::json::bail(json, "catalog_error", e))?;
+    let destination =
+        resolve_destination(&catalog, destination_name).map_err(|e| crate::json::bail(json, "destination_not_found", e))?;
     let progress = Arc::new(TerminalProgress::new());
-    let result = archive::backup(&destination, &source_dir, progress.clone()).await;
+    let request = workflow::ArchiveRequest {
+        udid: udid.to_string(),
+        working_root: working_root.to_path_buf(),
+        destination: &destination,
+    };
+
+    let result = workflow::run_archive(catalog, request, progress.clone()).await;
     progress.finish();
 
-    match result {
-        Ok(summary) => {
-            catalog.finish_archive(
-                archive_id,
-                ArchiveState::Succeeded,
-                Some(&summary.snapshot_id),
-                None,
-            )?;
-            println!(
-                "Archived: restic snapshot {} — {} new data written ({} processed, {} files).",
-                summary.snapshot_id,
-                human_bytes(summary.data_added),
-                human_bytes(summary.total_bytes_processed),
-                summary.total_files_processed,
-            );
-            Ok(())
+    let outcome_err = match result {
+        Ok(outcome) => {
+            if json {
+                crate::json::print_ok(ArchiveJson {
+                    snapshot_id: outcome.summary.snapshot_id.clone(),
+                    data_added: outcome.summary.data_added,
+                    total_bytes_processed: outcome.summary.total_bytes_processed,
+                    total_files_processed: outcome.summary.total_files_processed,
+                });
+            } else {
+                println!(
+                    "Archived: restic snapshot {} — {} new data written ({} processed, {} files).",
+                    outcome.summary.snapshot_id,
+                    human_bytes(outcome.summary.data_added),
+                    human_bytes(outcome.summary.total_bytes_processed),
+                    outcome.summary.total_files_processed,
+                );
+            }
+            return Ok(());
         }
-        Err(e) => {
-            catalog.finish_archive(archive_id, ArchiveState::Failed, None, Some(&e.to_string()))?;
-            Err(e.into())
-        }
+        Err(e) => e,
+    };
+
+    // Stable category first, human message second — the category is what
+    // a script should actually match on; see json.rs's own doc.
+    let (category, message): (&str, String) = match outcome_err {
+        workflow::ArchiveError::NoVerifiedSnapshot => (
+            "no_verified_snapshot",
+            format!(
+                "No verified snapshot for {udid} yet — run `cradle backup --udid {udid}` first. \
+                 Per CLAUDE.md, an unverified backup is never treated as an archivable snapshot."
+            ),
+        ),
+        workflow::ArchiveError::SourceMissing(dir) => (
+            "source_missing",
+            format!(
+                "Catalog has a verified snapshot for {udid}, but {} doesn't exist. Did \
+                 --working-dir change since that backup ran?",
+                dir.display()
+            ),
+        ),
+        workflow::ArchiveError::NoLongerVerified(gate) if gate.outcome == verify::Outcome::NeedsPassword => (
+            "needs_password",
+            "Re-checking right before archiving found no stored backup password, so the current \
+             contents can't be confirmed — run `cradle password set` and back up again to get a \
+             verified snapshot."
+                .to_string(),
+        ),
+        workflow::ArchiveError::NoLongerVerified(gate) => (
+            "stale_verification",
+            format!(
+                "Re-checking the backup right before archiving found it no longer verifies, even \
+                 though the catalog has an earlier verified snapshot for {udid} — something has \
+                 changed it since (a newer backup run, most likely). Not archiving it:\n{}",
+                gate.problems.join("\n"),
+            ),
+        ),
+        workflow::ArchiveError::Locked(e) => ("locked", e.to_string()),
+        workflow::ArchiveError::Failed(e) => ("failed", e.to_string()),
+    };
+
+    if json {
+        crate::json::print_err(category, &message);
     }
+    anyhow::bail!(message)
 }
 
 async fn run_archive_list(catalog: &Catalog, destination_name: &str) -> anyhow::Result<()> {
@@ -873,12 +1173,32 @@ async fn run_archive_prune(
     Ok(())
 }
 
-async fn run_archive_check(catalog: &Catalog, destination_name: &str) -> anyhow::Result<()> {
+async fn run_archive_prune_preview(
+    catalog: &Catalog,
+    destination_name: &str,
+    policy: archive::RetentionPolicy,
+) -> anyhow::Result<()> {
     let destination = resolve_destination(catalog, destination_name)?;
-    println!(
-        "Checking repository integrity for '{destination_name}' (reads the whole repo, may take a while)..."
-    );
-    let summary = archive::check(&destination).await?;
+    println!("Previewing retention policy for '{destination_name}' — nothing will actually be removed.");
+    let preview = archive::preview_retention(&destination, &policy).await?;
+
+    if preview.removed.is_empty() {
+        println!("Would remove: none.");
+    } else {
+        println!("Would remove {} snapshot(s):", preview.removed.len());
+        for s in &preview.removed {
+            println!("  {}  {}", s.short_id, s.time);
+        }
+    }
+    println!("Would keep {} snapshot(s).", preview.kept.len());
+    println!("Run without --dry-run to actually apply this policy.");
+    Ok(())
+}
+
+async fn run_archive_check(catalog: &Catalog, destination_name: &str, mode: archive::CheckMode) -> anyhow::Result<()> {
+    let destination = resolve_destination(catalog, destination_name)?;
+    println!("Checking '{destination_name}': {}...", mode.description());
+    let summary = archive::check(&destination, mode).await?;
     if summary.num_errors == 0 {
         println!("No errors found.");
         Ok(())
@@ -888,6 +1208,13 @@ async fn run_archive_check(catalog: &Catalog, destination_name: &str) -> anyhow:
             summary.num_errors
         );
     }
+}
+
+#[derive(serde::Serialize)]
+struct RestoreJson {
+    target_udid: String,
+    source_udid: String,
+    rebooted: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -900,76 +1227,148 @@ async fn run_restore(
     scratch_root: PathBuf,
     no_reboot: bool,
     system_files: bool,
+    password_override: Option<String>,
     catalog_path: PathBuf,
+    json: bool,
 ) -> anyhow::Result<()> {
     // See run_backup's own comment.
     let _sleep_guard = SleepGuard::engage();
 
-    let udid = resolve_udid(udid).await?;
+    let udid = resolve_udid(udid).await.map_err(|e| crate::json::bail(json, "device_not_found", e))?;
     let source_udid = source_udid.unwrap_or_else(|| udid.clone());
-    let catalog = Catalog::open(&catalog_path)?;
+    let catalog = Catalog::open(&catalog_path).map_err(|e| crate::json::bail(json, "catalog_error", e))?;
 
-    println!("Staging backup for restore...");
+    if !json {
+        println!("Staging backup for restore...");
+    }
     let staged_dir = match (from_archive, restic_snapshot) {
         (Some(destination_name), Some(snapshot_id)) => {
-            let destination = resolve_destination(&catalog, &destination_name)?;
+            let destination = resolve_destination(&catalog, &destination_name)
+                .map_err(|e| crate::json::bail(json, "destination_not_found", e))?;
             let progress = Arc::new(TerminalProgress::new());
-            let summary = archive::restore(&destination, &snapshot_id, &scratch_root, progress.clone()).await?;
+            let summary = archive::restore(&destination, &snapshot_id, &scratch_root, progress.clone())
+                .await
+                .map_err(|e| crate::json::bail(json, "staging_failed", e.to_string()))?;
             progress.finish();
-            println!(
-                "Restored {} file(s) ({}) from '{destination_name}' into scratch.",
-                summary.files_restored,
-                human_bytes(summary.total_bytes)
-            );
+            if !json {
+                println!(
+                    "Restored {} file(s) ({}) from '{destination_name}' into scratch.",
+                    summary.files_restored,
+                    human_bytes(summary.total_bytes)
+                );
+            }
             summary.path
         }
-        _ => restore::stage_from_working(&working_root, &source_udid, &scratch_root).await?,
+        _ => {
+            let progress = Arc::new(TerminalProgress::new());
+            let staged = workflow::stage_restore_from_working(&working_root, &source_udid, &scratch_root, progress.clone())
+                .await
+                .map_err(|e| crate::json::bail(json, "staging_failed", e.to_string()))?;
+            progress.finish();
+            staged
+        }
     };
+    // Authoritative over the `--source-udid` default above — see that
+    // function's own doc for why this matters most for `--from-archive`.
+    let source_udid = restore::source_udid_from_staged_dir(&staged_dir).unwrap_or(source_udid);
 
-    let backup_ios = restore::backup_ios_version(&staged_dir)?;
+    let backup_ios =
+        restore::backup_ios_version(&staged_dir).map_err(|e| crate::json::bail(json, "invalid_backup", e))?;
+    let backup_size_bytes =
+        restore::staged_backup_size(&staged_dir).map_err(|e| crate::json::bail(json, "invalid_backup", e))?;
 
-    println!("Running restore prechecks...");
-    let report = precheck::run_restore(&udid, &backup_ios).await?;
+    if !json {
+        println!("Running restore prechecks...");
+    }
+    let report = precheck::run_restore(&udid, &backup_ios, backup_size_bytes)
+        .await
+        .map_err(|e| crate::json::bail(json, "precheck_error", e))?;
 
-    if let Some(info) = &report.device {
+    if !json && let Some(info) = &report.device {
         println!(
             "Target device: {} ({}, iOS {})",
             info.name, info.product_type, info.ios_version
         );
     }
     if !report.pairing_valid {
-        anyhow::bail!(report
-            .pairing_message
-            .unwrap_or_else(|| "Pairing check failed.".to_string()));
+        return Err(crate::json::bail(
+            json,
+            "pairing_invalid",
+            report.pairing_message.unwrap_or_else(|| "Pairing check failed.".to_string()),
+        ));
     }
     if !report.find_my_disabled {
-        anyhow::bail!(
-            "Find My is enabled on the target device. Disable it under Settings > [name] > \
-             Find My > Find My iPhone before restoring."
-        );
+        return Err(crate::json::bail(
+            json,
+            "find_my_enabled",
+            "Find My is enabled on the target device. Disable it under Settings > [name] > Find \
+             My > Find My iPhone before restoring."
+                .to_string(),
+        ));
     }
     if !report.target_ios_ok {
-        anyhow::bail!(
-            "Target device is on iOS {}, but this backup is from iOS {} — restoring backward \
-             isn't supported. Update the target device first.",
-            report.target_ios_version.as_deref().unwrap_or("unknown"),
-            report.backup_ios_version,
-        );
+        return Err(crate::json::bail(
+            json,
+            "ios_version_mismatch",
+            format!(
+                "Target device is on iOS {}, but this backup is from iOS {} — restoring backward \
+                 isn't supported. Update the target device first.",
+                report.target_ios_version.as_deref().unwrap_or("unknown"),
+                report.backup_ios_version,
+            ),
+        ));
+    }
+    if !report.enough_target_space {
+        return Err(crate::json::bail(
+            json,
+            "not_enough_space",
+            match report.target_free_bytes {
+                Some(free) => format!(
+                    "Not enough free space on the target device: this backup needs {:.1} GB, but \
+                     only {:.1} GB is free. Free up space on the device and try again.",
+                    backup_size_bytes as f64 / 1e9,
+                    free as f64 / 1e9,
+                ),
+                None => "Could not read how much free space the target device has — check that \
+                          it's unlocked and reachable, then try again."
+                    .to_string(),
+            },
+        ));
     }
 
+    // `runs.udid` references `devices(udid)` — without this, restoring
+    // onto a target Cradle has never backed up before records a run
+    // against a device row that doesn't exist yet (harmless only because
+    // SQLite foreign keys aren't enforced here; see CODEBASE_ANALYSIS.md).
+    if let Some(info) = &report.device {
+        catalog.upsert_device(&cradle_core::catalog::DeviceRecord {
+            udid: info.udid.clone(),
+            name: info.name.clone(),
+            product_type: info.product_type.clone(),
+            ios_version: info.ios_version.clone(),
+            encrypted: libimobiledevice::will_encrypt(&udid).await,
+        })?;
+    }
     let run_id = catalog.start_run(&udid, RunKind::Restore)?;
 
     let config = restore::RestoreConfig {
         reboot: !no_reboot,
         system_files,
+        ..Default::default()
     };
 
-    let stored_password = keychain::try_read(&keychain::device_account(&source_udid))?;
+    // An explicit `--password` overrides whatever's in the Keychain —
+    // never replaces it there — so an archive made under an older
+    // password stays restorable after a later `password set` changes
+    // what's on file. See the flag's own doc.
+    let stored_password = match password_override {
+        Some(p) => Some(p),
+        None => keychain::try_read(&keychain::device_account(&source_udid))?,
+    };
 
-    println!(
-        "Restoring {} (source {source_udid}) onto target {udid}...",
-        staged_dir.display()
-    );
+    if !json {
+        println!("Restoring {} (source {source_udid}) onto target {udid}...", staged_dir.display());
+    }
     let progress = Arc::new(TerminalProgress::new());
     let result = restore::run(
         &udid,
@@ -985,19 +1384,26 @@ async fn run_restore(
     match result {
         Ok(outcome) => {
             catalog.finish_run(run_id, RunStatus::Succeeded, 0, 0, None)?;
-            println!(
-                "Restore complete on {}.{}",
-                outcome.target_udid,
-                if config.reboot {
-                    " Device will reboot."
-                } else {
-                    ""
-                }
-            );
+            if json {
+                crate::json::print_ok(RestoreJson {
+                    target_udid: outcome.target_udid,
+                    source_udid,
+                    rebooted: config.reboot,
+                });
+            } else {
+                println!(
+                    "Restore complete on {}.{}",
+                    outcome.target_udid,
+                    if config.reboot { " Device will reboot." } else { "" }
+                );
+            }
             Ok(())
         }
         Err(e) => {
             catalog.finish_run(run_id, RunStatus::Failed, 0, 0, Some(&e.to_string()))?;
+            if json {
+                crate::json::print_err("failed", &e);
+            }
             Err(e.into())
         }
     }
@@ -1036,6 +1442,7 @@ async fn run_password(command: PasswordCommand) -> anyhow::Result<()> {
                 anyhow::bail!("Password was empty — not enabling encryption.");
             }
             println!("Sending ChangePassword to the device — check it for a prompt if this hangs...");
+            let working_dir = working_dir.unwrap_or_else(cradle_core::paths::default_working_dir);
             backup::set_encryption(&udid, &working_dir, None, Some(&password)).await?;
             keychain::store(&keychain::device_account(&udid), &password)?;
             println!(
@@ -1052,30 +1459,39 @@ async fn run_decrypt(
     input: PathBuf,
     output: PathBuf,
     encryption_key_hex: String,
+    password_override: Option<String>,
 ) -> anyhow::Result<()> {
     let udid = resolve_udid(udid).await?;
-    let password = keychain::try_read(&keychain::device_account(&udid))?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "No stored backup password for {udid} — run `cradle password set --udid {udid}` first."
-        )
-    })?;
+    // See `restore`'s own `--password` doc: an explicit override here
+    // works the same way, for the same reason (a backup made under an
+    // older password than what's currently stored).
+    let password = match password_override {
+        Some(p) => p,
+        None => keychain::try_read(&keychain::device_account(&udid))?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No stored backup password for {udid} — run `cradle password set --udid {udid}` \
+                 first, or pass --password directly if it's changed since this backup was made."
+            )
+        })?,
+    };
 
     let backup_dir = working_root.join(&udid);
     let keybag = Keybag::unlock_from_backup_dir(&backup_dir, &password)?;
 
     let encryption_key = hex::decode(encryption_key_hex.trim())
         .map_err(|e| anyhow::anyhow!("--encryption-key is not valid hex: {e}"))?;
-    let ciphertext = std::fs::read(backup_dir.join(&input))
+    let mut buf = std::fs::read(backup_dir.join(&input))
         .map_err(|e| anyhow::anyhow!("could not read {}: {e}", input.display()))?;
-    let decrypted = keybag.decrypt(&ciphertext, &encryption_key)?;
+    // Decrypted in place — see `Keybag::decrypt`'s doc for why this
+    // doesn't allocate a second same-sized buffer for the plaintext.
+    keybag.decrypt(&mut buf, &encryption_key)?;
 
-    std::fs::write(&output, &decrypted)
-        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", output.display()))?;
+    std::fs::write(&output, &buf).map_err(|e| anyhow::anyhow!("could not write {}: {e}", output.display()))?;
     println!(
         "Decrypted {} ({} bytes) to {}. Note: output may have trailing pad bytes past the \
          file's true size — see crypto.rs's `Keybag::decrypt` doc if that matters for this file.",
         input.display(),
-        decrypted.len(),
+        buf.len(),
         output.display()
     );
     Ok(())
