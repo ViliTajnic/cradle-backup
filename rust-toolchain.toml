@@ -1,5 +1,5 @@
 [toolchain]
-# ROADMAP.md's floor is Rust 1.85+ (edition 2024), but Cradle's own code uses
+# Cradle's floor is Rust 1.85+ (edition 2024), but its own code uses
 # let-chains (`if let Some(x) = a && b { ... }`), which need a newer stable
 # than 1.85. Track stable rather than pin an exact patch so that stays
 # satisfied.

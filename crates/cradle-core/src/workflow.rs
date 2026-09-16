@@ -305,8 +305,8 @@ pub async fn run_archive(
 
 /// Copies a backup out of the working set into `scratch_root`, holding
 /// the working-set lock only for that copy — restore itself runs
-/// entirely out of the scratch copy afterward (CLAUDE.md: restore "does
-/// not touch the working set").
+/// entirely out of the scratch copy afterward and never touches the
+/// working set.
 pub async fn stage_restore_from_working(
     working_root: &Path,
     source_udid: &str,

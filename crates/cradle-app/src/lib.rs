@@ -1,8 +1,8 @@
-//! Cradle desktop app (M7) — a Tauri shell around the same `cradle-core`
-//! the CLI drives. Per CLAUDE.md: "The progress rendering is the whole
-//! point" — this exists because Finder's indeterminate barber-pole while
-//! moving 70+ GB is the failure this whole project responds to, so the
-//! backup screen shows real files/bytes/rate/ETA, not a spinner.
+//! Cradle desktop app — a Tauri shell around the same `cradle-core` the
+//! CLI drives. The progress rendering is the whole point: this exists
+//! because Finder's indeterminate barber-pole while moving 70+ GB is the
+//! failure this whole project responds to, so the backup screen shows
+//! real files/bytes/rate/ETA, not a spinner.
 
 mod commands;
 mod progress;

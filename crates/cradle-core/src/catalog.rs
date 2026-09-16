@@ -1,18 +1,18 @@
 //! The catalog: devices, runs, snapshots, destinations, archives.
 //!
-//! Per CLAUDE.md: "Keep it small. It tracks devices, runs and snapshots —
-//! not file-level deltas." `destinations` and `archives` joined this
-//! schema in M3, once there was an archive layer to populate them.
+//! Kept small: it tracks devices, runs and snapshots — not file-level
+//! deltas. `destinations` and `archives` joined this schema once there was
+//! an archive layer to populate them.
 //!
 //! Secrets never live here. `devices.credential_ref` and
 //! `destinations.credential_ref` are names to look up in the macOS
 //! Keychain (Windows DPAPI later) — see [`crate::keychain`] — never a
 //! secret value itself. `devices.credential_ref` still isn't populated by
-//! anything; nothing needs a per-device stored secret before M5's crypto
-//! layer. `destinations.credential_ref` is populated from M3 on: every
-//! restic repository needs a password, and restic — not Cradle — is the
-//! thing that encrypts archived data (CLAUDE.md: "Do not build: archive
-//! encryption").
+//! anything; nothing needs a per-device stored secret before the crypto
+//! layer. `destinations.credential_ref` is populated once an archive
+//! destination exists: every restic repository needs a password, and
+//! restic — not Cradle — is the thing that encrypts archived data (Cradle
+//! doesn't build its own archive encryption).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -397,9 +397,9 @@ impl Catalog {
     }
 
     /// Records a snapshot produced by `run_id`. `verified` should reflect
-    /// whether [`crate::verify::Report::passed`] returned true — per
-    /// CLAUDE.md, an unverified run must never look like a trustworthy
-    /// snapshot, so callers must not call this for a run that failed the
+    /// whether [`crate::verify::Report::passed`] returned true — an
+    /// unverified run must never look like a trustworthy snapshot, so
+    /// callers must not call this for a run that failed the
     /// gate.
     pub fn record_snapshot(
         &self,
@@ -500,9 +500,9 @@ impl Catalog {
     }
 
     /// The most recently taken *verified* snapshot for `udid`, if any.
-    /// What `cradle archive` looks for — per CLAUDE.md, a partial backup
-    /// must never become a snapshot, so archiving must never pick up one
-    /// that hasn't passed the verification gate.
+    /// What `cradle archive` looks for — a partial backup must never
+    /// become a snapshot, so archiving must never pick up one that hasn't
+    /// passed the verification gate.
     pub fn latest_verified_snapshot(
         &self,
         udid: &str,

@@ -1,9 +1,8 @@
 //! A rewritable terminal progress line with real numbers.
 //!
-//! Per CLAUDE.md: "Finder shows an indeterminate barber-pole while moving
-//! 70+ GB; that failure is the reason this project exists." This prints
-//! files done, a percentage, transfer rate, bytes moved, and an ETA —
-//! never a spinner.
+//! Finder shows an indeterminate barber-pole while moving 70+ GB — that
+//! failure is the reason this project exists. This prints files done, a
+//! percentage, transfer rate, bytes moved, and an ETA — never a spinner.
 
 use std::io::Write;
 use std::sync::Mutex;

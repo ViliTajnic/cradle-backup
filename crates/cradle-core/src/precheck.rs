@@ -1,8 +1,9 @@
 //! Prechecks: never start a transfer we already know will fail.
 //!
-//! Per CLAUDE.md, M0's share of this is pairing validity, backup encryption,
-//! and free space on the working volume. Restore-only prechecks (Find My
-//! off, target iOS >= backup iOS) land in M4 alongside restore itself.
+//! For a backup: pairing validity, backup encryption, and free space on
+//! the working volume. For a restore: Find My off on the target, target
+//! iOS version >= the backup's, and enough free space on the target
+//! device for the backup being restored.
 
 use std::path::Path;
 
@@ -136,9 +137,8 @@ pub async fn run(udid: &str, working_dir: &Path) -> Result<Report, CradleError> 
 }
 
 /// Result of running the restore-only prechecks against the *target*
-/// device. Per CLAUDE.md: "Restore only: Find My iPhone disabled on
-/// target" / "Restore only: target iOS version >= backup's iOS version
-/// (read `Product Version` from `Info.plist`)".
+/// device: Find My iPhone disabled on the target, and target iOS version
+/// >= the backup's own (read from its `Info.plist`'s `Product Version`).
 #[derive(Debug, Clone)]
 pub struct RestoreReport {
     pub pairing_valid: bool,
@@ -162,8 +162,7 @@ pub struct RestoreReport {
 
 impl RestoreReport {
     /// `true` only if every check passed. A restore must not start
-    /// otherwise — CLAUDE.md's non-negotiable #1 makes restore free and
-    /// unconditional, not unchecked.
+    /// otherwise — free and unconditional doesn't mean unchecked.
     pub fn passed(&self) -> bool {
         self.pairing_valid && self.find_my_disabled && self.target_ios_ok && self.enough_target_space
     }
@@ -180,9 +179,9 @@ impl RestoreReport {
 /// itself only discovers "not enough room on the target" after the full
 /// staging copy (tens of minutes for a large backup) *and* the on-device
 /// transfer are both already under way, reporting it as an opaque
-/// `MBErrorDomain 106` at the very end — exactly the "failing mid-transfer
-/// instead of a precheck" CLAUDE.md's working agreements call out.
-/// `ideviceinfo` can read the target's free space up front for free.
+/// `MBErrorDomain 106` at the very end — exactly the failing-mid-transfer
+/// case a precheck should catch instead. `ideviceinfo` can read the
+/// target's free space up front for free.
 pub async fn run_restore(udid: &str, backup_ios_version: &str, backup_size_bytes: u64) -> Result<RestoreReport, CradleError> {
     let pairing = libimobiledevice::check_pairing(udid).await?;
     if !pairing.valid {

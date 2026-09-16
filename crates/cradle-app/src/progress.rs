@@ -1,8 +1,8 @@
 //! Bridges [`cradle_core::backup::ProgressSink`] to Tauri events, so the
 //! webview gets the same honest, real-time progress the CLI's
-//! `TerminalProgress` prints — files/bytes/rate/ETA, never a spinner. See
-//! CLAUDE.md: "Every long-running operation reports files done/total,
-//! bytes, rate, ETA, and current domain."
+//! `TerminalProgress` prints — files/bytes/rate/ETA, never a spinner.
+//! Every long-running operation reports files done/total, bytes, rate,
+//! ETA, and current domain.
 //!
 //! Used for both a device backup and an archive run — `archive::backup`
 //! takes the same `ProgressSink` the device protocol does (see

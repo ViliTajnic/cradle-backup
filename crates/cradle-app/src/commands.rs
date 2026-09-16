@@ -1,9 +1,8 @@
 //! Tauri commands: the desktop app's entire surface toward `cradle-core`.
 //!
 //! Deliberately thin wrappers over the same primitives `cradle-cli` calls —
-//! no separate "app edition" of the backup logic, per CLAUDE.md's
-//! "one webview frontend" framing and the project's broader rule that the
-//! UI is a consumer of the core, not a parallel implementation.
+//! no separate "app edition" of the backup logic: one webview frontend,
+//! and the UI is a consumer of the core, not a parallel implementation.
 //!
 //! `run_backup` currently re-implements the precheck → backup → verify →
 //! catalog sequence `cradle-cli`'s `run_backup` also has, rather than both
@@ -751,10 +750,10 @@ pub async fn list_local_backups(working_dir: Option<String>) -> Result<Vec<Local
 /// Permanently deletes `working_dir/<udid>` — the entire local backup for
 /// one device, freeing whatever it was using on disk. Does not touch the
 /// catalog's history (past runs/snapshots stay visible), only the actual
-/// files; does not touch any archived copy either, per CLAUDE.md's
-/// architecture ("Archiving copies out of it" — the working set and its
-/// archives are always independent copies, deleting one is never supposed
-/// to reach the other).
+/// files; does not touch any archived copy either — the working set and
+/// its archives are always independent copies (archiving copies *out of*
+/// the working set), so deleting one is never supposed to reach the
+/// other.
 ///
 /// Takes the same [`WorkingSetLock`] every other operation on this
 /// device's working set does, so this can't run concurrently with a
@@ -793,8 +792,7 @@ pub struct RestoreSummary {
 /// this, the app could create an archive but never restore one back
 /// (CODEBASE_ANALYSIS.md's "Desktop archive restore" gap).
 ///
-/// Free, unconditional, forever — no license check, no network call
-/// (CLAUDE.md non-negotiable #1).
+/// Free, unconditional, forever — no license check, no network call.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // one flat arg per Tauri invoke() param — same as cradle-cli's own run_restore
 pub async fn run_restore(

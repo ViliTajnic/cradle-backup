@@ -15,7 +15,7 @@
 //! on `Manifest.db` and to support raw file extraction. Manifest
 //! *browsing* (listing files by domain/path) additionally needs an
 //! NSKeyedArchiver decoder for the `Files` table's `file` BLOB column —
-//! deliberately not built in this pass; see `ROADMAP.md`'s M5 section.
+//! deliberately not built in this pass.
 
 use std::collections::HashMap;
 use std::path::Path;

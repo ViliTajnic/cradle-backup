@@ -6,10 +6,10 @@
 //! failed to read/write a backup file), consistent with the Mac or the
 //! external drive going to sleep mid-transfer during that unattended hour.
 //!
-//! macOS only for now (Windows is M9). Wraps `caffeinate` as a subprocess
-//! rather than binding IOKit's power-assertion API directly — matching
-//! CLAUDE.md's "wrap, don't reimplement" bias, `caffeinate` *is* the
-//! documented interface Apple ships for exactly this.
+//! macOS only for now (Windows support is a future project). Wraps
+//! `caffeinate` as a subprocess rather than binding IOKit's
+//! power-assertion API directly — wrap, don't reimplement: `caffeinate`
+//! *is* the documented interface Apple ships for exactly this.
 
 /// Holds a system sleep assertion for as long as it's alive. Drop it (or
 /// let it fall out of scope) to release the assertion.

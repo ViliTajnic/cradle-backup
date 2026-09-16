@@ -5,13 +5,14 @@
 //! backup") three separate times across one session, and every single
 //! time, free memory measured under ~150MB at the moment of failure. No
 //! amount of retry logic in `backup::run_resilient` can outrun a machine
-//! that's chronically starved for RAM during a multi-hour transfer — per
-//! CLAUDE.md's working agreements, "prefer failing a precheck over
-//! failing mid-transfer," so this exists to let `precheck::run` catch a
-//! doomed attempt before it burns an hour finding out the hard way.
+//! that's chronically starved for RAM during a multi-hour transfer —
+//! better to fail a precheck than fail mid-transfer, so this exists to
+//! let `precheck::run` catch a doomed attempt before it burns an hour
+//! finding out the hard way.
 //!
-//! macOS only for now (Windows is M9), via `vm_stat` — same "wrap, don't
-//! reimplement" reasoning as `power::SleepGuard`/`notify::alert`: shelling
+//! macOS only for now (Windows support is a future project), via `vm_stat`
+//! — same "wrap, don't reimplement" reasoning as
+//! `power::SleepGuard`/`notify::alert`: shelling
 //! out to the OS's own diagnostic tool is simpler and more portable across
 //! macOS versions than binding `host_statistics64` directly for one
 //! number.

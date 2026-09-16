@@ -1,15 +1,15 @@
 //! Restores a backup onto a device.
 //!
-//! Per CLAUDE.md's non-negotiable #1: "Restore is free, unconditional,
-//! forever. No license check, no network call, no tier gate anywhere on
-//! the restore path." Nothing in this module touches licensing or makes a
-//! network call beyond the device/restic protocols it already needs.
+//! Restore is free, unconditional, forever — no license check, no network
+//! call, no tier gate anywhere on the restore path. Nothing in this
+//! module touches licensing or makes a network call beyond the
+//! device/restic protocols it already needs.
 //!
-//! Per the architecture: "Restore copies a snapshot into a scratch
-//! directory and runs the restore protocol from there. It does not touch
-//! the working set." [`stage_from_working`] only ever *reads* from
-//! `working/<UDID>/`; [`run`] only ever touches the scratch directory it's
-//! given, never the working set.
+//! Restore copies a snapshot into a scratch directory and runs the
+//! restore protocol from there; it does not touch the working set.
+//! [`stage_from_working`] only ever *reads* from `working/<UDID>/`;
+//! [`run`] only ever touches the scratch directory it's given, never the
+//! working set.
 //!
 //! The restore protocol itself is driven by `idevicebackup2 restore` (see
 //! [`crate::libimobiledevice`]) as a subprocess — see `backup.rs`'s module
@@ -213,9 +213,9 @@ pub fn source_udid_from_staged_dir(staged_dir: &Path) -> Option<String> {
 }
 
 /// Reads the backup's own recorded iOS version from its `Info.plist`
-/// (the `"Product Version"` key — CLAUDE.md is explicit about this being
-/// the source of truth for the restore precheck: the *backup's* version,
-/// not whatever the original source device happens to be running now).
+/// (the `"Product Version"` key) — this is the source of truth for the
+/// restore precheck: the *backup's* version, not whatever the original
+/// source device happens to be running now.
 pub fn backup_ios_version(staged_dir: &Path) -> Result<String, CradleError> {
     let value = plist::Value::from_file(staged_dir.join("Info.plist"))
         .map_err(|e| CradleError::Other(format!("could not read Info.plist: {e}")))?;
@@ -229,9 +229,9 @@ pub fn backup_ios_version(staged_dir: &Path) -> Result<String, CradleError> {
 
 /// Restore configuration — a thin, Cradle-flavored subset of
 /// `idevicebackup2 restore`'s own flags. Deliberately not everything that
-/// tool exposes: CLAUDE.md is explicit that selective restore isn't
-/// happening, and the remaining flags don't have a meaningful default
-/// worth exposing yet.
+/// tool exposes: selective restore isn't happening (MobileBackup2 restore
+/// is all-or-nothing at the protocol level), and the remaining flags
+/// don't have a meaningful default worth exposing yet.
 #[derive(Debug, Clone)]
 pub struct RestoreConfig {
     pub reboot: bool,
@@ -250,8 +250,9 @@ pub struct RestoreConfig {
     /// restoration to fail outright, fixed there by dropping `--settings`
     /// in favor of `--system --no-reboot` instead. Overwriting the
     /// *target* device's own settings with a *different* device's appears
-    /// to risk exactly the kind of activation/account-state mismatch
-    /// CLAUDE.md's non-negotiable #1 can't tolerate any risk of — a
+    /// to risk exactly the kind of activation/account-state mismatch that
+    /// restore — free, unconditional, and never allowed to put anything
+    /// between a user and their own data — can't tolerate any risk of: a
     /// restore that looks like it worked and then silently doesn't is
     /// worse than the slower app-redownload this was meant to fix.
     pub restore_settings: bool,
@@ -280,11 +281,10 @@ pub struct Outcome {
 ///
 /// `source_udid` is the UDID the backup was originally taken from, which
 /// may differ from the target device's own UDID — that's cross-device
-/// migration (`ROADMAP.md` M4: "Cross-device migration via
-/// `source_identifier`"). `staged_dir`'s *parent* becomes the backup
-/// root passed to the protocol, since it expects `backup_root/<source_udid>/`
-/// to exist underneath it — the same convention [`crate::backup::run`]
-/// writes into, which both staging functions preserve.
+/// migration. `staged_dir`'s *parent* becomes the backup root passed to
+/// the protocol, since it expects `backup_root/<source_udid>/` to exist
+/// underneath it — the same convention [`crate::backup::run`] writes
+/// into, which both staging functions preserve.
 ///
 /// `password`, if the backup is encrypted, is the *source* backup's own
 /// password (the one `cradle password set`/`enable` stored for

@@ -1,8 +1,8 @@
 //! Serializes operations against one working set (`working_root/<UDID>/`).
 //!
-//! CLAUDE.md: `working/<UDID>/` is canonical, and mobilebackup2 computes
-//! incrementals by inspecting exactly the state that directory is in right
-//! now. Two operations touching it at once — a second backup starting
+//! `working/<UDID>/` is canonical, and mobilebackup2 computes incrementals
+//! by inspecting exactly the state that directory is in right now. Two
+//! operations touching it at once — a second backup starting
 //! while the first is still writing, or an archive reading it mid-backup —
 //! don't just race, they can hand a real device transfer stale or
 //! half-written state. [`WorkingSetLock::acquire`] must be held across
@@ -121,9 +121,9 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
-    // Windows isn't a supported Cradle target yet (CLAUDE.md) — only the
-    // in-process guard applies there for now, rather than a hard failure
-    // that would block running the rest of this workspace's tests on it.
+    // Windows isn't a supported Cradle target yet — only the in-process
+    // guard applies there for now, rather than a hard failure that would
+    // block running the rest of this workspace's tests on it.
     Ok(())
 }
 

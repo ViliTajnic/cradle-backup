@@ -64,8 +64,8 @@ pub async fn wait_and_propagate_termination() -> ! {
 
 #[cfg(not(unix))]
 pub async fn wait_and_propagate_termination() -> ! {
-    // Windows isn't a supported Cradle target yet (CLAUDE.md) — block
-    // forever rather than exiting immediately, so a `tokio::select!`
-    // racing this against real work never picks this branch by accident.
+    // Windows isn't a supported Cradle target yet — block forever rather
+    // than exiting immediately, so a `tokio::select!` racing this against
+    // real work never picks this branch by accident.
     std::future::pending().await
 }

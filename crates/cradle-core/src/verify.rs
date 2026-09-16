@@ -1,7 +1,7 @@
 //! The verification gate: runs after every backup, before any archive.
 //!
-//! Per CLAUDE.md, all three must pass or the run is marked failed and
-//! nothing gets archived:
+//! All three must pass or the run is marked failed and nothing gets
+//! archived:
 //!
 //! 1. `Status.plist` reports the run finished
 //! 2. `Manifest.db` opens and passes `PRAGMA integrity_check`
@@ -78,9 +78,9 @@ pub struct Report {
 }
 
 impl Report {
-    /// `true` only for [`Outcome::Verified`]. CLAUDE.md: failure marks the
-    /// run failed and archives nothing — callers must not archive past
-    /// anything else, `NeedsPassword` included.
+    /// `true` only for [`Outcome::Verified`]. Failure marks the run failed
+    /// and archives nothing — callers must not archive past anything else,
+    /// `NeedsPassword` included.
     pub fn passed(&self) -> bool {
         self.outcome == Outcome::Verified
     }
@@ -192,7 +192,7 @@ fn status_finished(backup_dir: &Path) -> bool {
 
 /// Reads `Manifest.plist`'s `IsEncrypted` flag. Defaults to `true` (the
 /// stricter check) if the file can't be read, since every backup Cradle
-/// makes is supposed to be encrypted per CLAUDE.md's non-negotiables.
+/// makes is supposed to be encrypted.
 fn backup_is_encrypted(backup_dir: &Path) -> bool {
     plist::Value::from_file(backup_dir.join("Manifest.plist"))
         .ok()

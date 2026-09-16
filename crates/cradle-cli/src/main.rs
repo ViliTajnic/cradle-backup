@@ -1,10 +1,10 @@
-//! Cradle CLI — M0 connect/precheck/backup, M1 verification gate, M2
-//! catalog, M3 archive layer, M4 restore, M5 decryption, M6 polish.
+//! Cradle CLI — device connect/precheck/backup, verification gate,
+//! catalog, archive layer, restore, decryption.
 //!
-//! Per CLAUDE.md, the CLI is not a debug tool: it ships, it is supported,
-//! and it is the free tier's complete interface. Restore in particular is
-//! free, unconditional, forever (non-negotiable #1) — nothing on the
-//! `run_restore` path below checks a license or calls out to a server.
+//! The CLI is not a debug tool: it ships, it is supported, and it is the
+//! free tier's complete interface. Restore in particular is free,
+//! unconditional, forever — nothing on the `run_restore` path below
+//! checks a license or calls out to a server.
 
 mod json;
 mod progress;
@@ -78,16 +78,15 @@ enum Command {
     },
     /// Archive a verified snapshot out to a destination.
     ///
-    /// Per CLAUDE.md's architecture: "Archiving copies out of it [the
-    /// working directory]" — never in place, never touching the source.
+    /// Archiving copies out of the working directory — never in place,
+    /// never touching the source.
     Archive {
         #[command(subcommand)]
         command: ArchiveCommand,
     },
     /// Restore a backup onto a device.
     ///
-    /// Free, unconditional, forever — no license check, no network call
-    /// (CLAUDE.md non-negotiable #1).
+    /// Free, unconditional, forever — no license check, no network call.
     Restore {
         /// Target device UDID — the device being restored *onto*.
         #[arg(long)]
@@ -112,7 +111,7 @@ enum Command {
         #[arg(long)]
         working_dir: Option<PathBuf>,
         /// Staging area the restore is run from — never the working
-        /// directory itself (see CLAUDE.md's architecture rule).
+        /// directory itself.
         /// Defaults to the same location the desktop app uses
         /// (`~/Cradle/scratch`) when omitted.
         #[arg(long)]
@@ -128,10 +127,9 @@ enum Command {
         /// what's stored in the Keychain for it — e.g. restoring an
         /// archive made before a later `cradle password set` changed
         /// what's on file. Overrides the stored password rather than
-        /// replacing it; nothing here touches the Keychain. Per
-        /// CLAUDE.md's non-negotiable #1, restore must stay possible even
-        /// after Cradle's own stored copy no longer matches — this is
-        /// that path.
+        /// replacing it; nothing here touches the Keychain. Restore must
+        /// stay possible even after Cradle's own stored copy no longer
+        /// matches — this is that path.
         #[arg(long)]
         password: Option<String>,
     },
@@ -317,7 +315,7 @@ enum ArchiveCommand {
         destination: String,
         /// Must match the `--working-dir` the snapshot was backed up
         /// into — the catalog doesn't store a path, only that one
-        /// canonical `<root>/<UDID>/` convention (see CLAUDE.md).
+        /// canonical `<root>/<UDID>/` convention.
         /// Defaults to the same location the desktop app uses
         /// (`~/Cradle/working`) when omitted.
         #[arg(long)]
@@ -1107,7 +1105,7 @@ async fn run_archive_run(
             "no_verified_snapshot",
             format!(
                 "No verified snapshot for {udid} yet — run `cradle backup --udid {udid}` first. \
-                 Per CLAUDE.md, an unverified backup is never treated as an archivable snapshot."
+                 An unverified backup is never treated as an archivable snapshot."
             ),
         ),
         workflow::ArchiveError::SourceMissing(dir) => (

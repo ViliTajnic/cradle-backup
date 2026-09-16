@@ -1,15 +1,15 @@
 //! Device protocol, prechecks, backup orchestration, the catalog, the
 //! archive layer, restore, and backup decryption for Cradle.
 //!
-//! M0-M5 scope (see `/ROADMAP.md`): connect to a device over
-//! `mobilebackup2`, run prechecks, perform a backup into the canonical
-//! working directory with honest progress reporting, verify it, record it
-//! in a small local catalog, archive it out to a restic-backed
-//! destination, restore it back onto a device — free and unconditional per
-//! CLAUDE.md's non-negotiable #1 — and, given the backup password, decrypt
-//! `Manifest.db` and individual files. Manifest *browsing* (listing files
-//! by domain/path, which needs an NSKeyedArchiver decoder) isn't built
-//! yet — see `crypto.rs`'s module doc.
+//! Connects to a device over `mobilebackup2`, runs prechecks, performs a
+//! backup into the canonical working directory with honest progress
+//! reporting, verifies it, records it in a small local catalog, archives
+//! it out to a restic-backed destination, restores it back onto a device
+//! — free and unconditional, no license check or network call anywhere on
+//! that path — and, given the backup password, decrypts `Manifest.db` and
+//! individual files. Manifest *browsing* (listing files by domain/path,
+//! which needs an NSKeyedArchiver decoder) isn't built yet — see
+//! `crypto.rs`'s module doc.
 
 pub mod archive;
 pub mod backup;
@@ -111,8 +111,8 @@ pub enum CradleError {
     /// rather than the device's own opaque "Restore Failed (Error Code
     /// 207)." — confirmed against a real restore attempt where that raw
     /// text was the *entire* error shown, with nothing naming what 207
-    /// actually means (CLAUDE.md: "Error messages name the fix, not the
-    /// symptom").
+    /// actually means. Error messages should name the fix, not the
+    /// symptom.
     #[error(
         "the backup password Cradle sent was rejected — the device could not unlock this \
          backup with it. Double-check the password (or use the override field if this backup \

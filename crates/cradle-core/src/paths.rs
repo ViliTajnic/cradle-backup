@@ -18,16 +18,17 @@
 use std::path::PathBuf;
 
 /// `~/Cradle/working` — the canonical working set's default root.
-/// `working_root.join(<UDID>)` is what CLAUDE.md calls canonical; this
-/// function only supplies where `working_root` itself defaults to when a
-/// caller hasn't set `--working-dir` / the app's storage setting.
+/// `working_root.join(<UDID>)` is the canonical location for a device's
+/// backup; this function only supplies where `working_root` itself
+/// defaults to when a caller hasn't set `--working-dir` / the app's
+/// storage setting.
 pub fn default_working_dir() -> PathBuf {
     base_dir().join("working")
 }
 
 /// `~/Cradle/scratch` — where a restore is staged before the protocol
-/// touches the target device. Per CLAUDE.md's architecture rule, this is
-/// never the working set itself.
+/// touches the target device. By design, this is never the working set
+/// itself.
 pub fn default_scratch_dir() -> PathBuf {
     base_dir().join("scratch")
 }

@@ -8,8 +8,7 @@
 //! reproducing regardless of working directory history or destination
 //! volume. `idevicebackup2`, run directly against the same device with the
 //! same live data, completed cleanly — isolating the bug to `idevice`
-//! itself rather than the device, the data, or the environment. See
-//! `CLAUDE.md`'s Stack section for the full story.
+//! itself rather than the device, the data, or the environment.
 //!
 //! These tools are a runtime *subprocess* dependency, the same footing as
 //! `restic`/`rclone` elsewhere in Cradle — not a linked library, so this
@@ -199,9 +198,9 @@ pub struct PairingCheck {
     pub message: Option<String>,
 }
 
-/// Checks whether this Mac has a valid pairing record for `udid`, per
-/// CLAUDE.md: "stale pairing is the most common failure; surface 'tap
-/// Trust on the device' as a UI state, not an error."
+/// Checks whether this Mac has a valid pairing record for `udid` — a
+/// stale pairing is the most common failure, surfaced as a "tap Trust on
+/// the device" UI state, not an error.
 pub async fn check_pairing(udid: &str) -> Result<PairingCheck, CradleError> {
     let (ok, stdout, stderr) = run_capture("idevicepair", &["-u", udid, "validate"]).await?;
     if ok {
@@ -344,8 +343,8 @@ fn parse_human_bytes(s: &str) -> Option<u64> {
 /// used, by looking for the `MBErrorDomain` code the tool's own
 /// `"ErrorCode %d: %s"` text prints. Falls back to
 /// [`CradleError::ToolFailed`] for anything else — still a real message
-/// naming the tool's own diagnosis, per CLAUDE.md's "name the fix, not the
-/// symptom" rule, just not one of the two Cradle retries automatically.
+/// naming the tool's own diagnosis (error messages should name the fix,
+/// not the symptom), just not one of the two Cradle retries automatically.
 fn classify_error(message: &str) -> CradleError {
     let has_code = |code: &str| {
         message
@@ -616,8 +615,8 @@ pub(crate) async fn run_idevicebackup2(args: &[&str], env: &[(&str, &str)], prog
         // Confirmed via direct manual `idevicebackup2` runs against the
         // same device that this is consistent with a dropped USB/network
         // connection to the device mid-connect, not a Cradle-side bug —
-        // CLAUDE.md: "Error messages name the fix, not the symptom," so
-        // this names the fix even though the tool gave nothing to classify.
+        // so this names the fix even though the tool gave nothing to
+        // classify.
         let message = parsed.last_error.clone().or_else(|| stderr_lines.into_iter().rev().find(|l| !l.trim().is_empty())).unwrap_or_else(|| {
             format!(
                 "idevicebackup2 exited unexpectedly ({status}) without printing an error — this \

@@ -1,14 +1,14 @@
 //! Archive layer: a `restic` subprocess wrapper.
 //!
-//! Per CLAUDE.md's "Do not build" list, restic already solves diff engines,
-//! dedup, retention logic, archive encryption/compression, and cloud
-//! transports — this module wraps it, it does not reimplement any of that.
-//! Every restic-compatible repository URI works here unchanged (a local
-//! path, `sftp:user@host:/path`, `s3:s3.amazonaws.com/bucket`, `b2:bucket:path`,
+//! restic already solves diff engines, dedup, retention logic, archive
+//! encryption/compression, and cloud transports — this module wraps it,
+//! it does not reimplement any of that. Every restic-compatible
+//! repository URI works here unchanged (a local path,
+//! `sftp:user@host:/path`, `s3:s3.amazonaws.com/bucket`, `b2:bucket:path`,
 //! ...): Cradle has no backend-specific code because restic's own backend
-//! abstraction already is that code. That's also why `ROADMAP.md`'s "local
-//! first, then NAS, then S3/B2" phasing doesn't need separate code paths —
-//! it's a validation order, not an implementation order.
+//! abstraction already is that code. That's also why validating "local
+//! first, then NAS, then S3/B2" doesn't need separate code paths — it's a
+//! validation order, not an implementation order.
 //!
 //! `working/<UDID>/` stays canonical (see `backup.rs`): this module only
 //! ever *reads* from it, via `restic backup`, and never writes into it.
@@ -559,9 +559,8 @@ pub async fn preview_retention(
 
 /// Applies `policy` to `destination`'s repository via `restic forget
 /// --prune`, actually reclaiming space rather than just dropping snapshot
-/// references (`--prune` — CLAUDE.md's "retention logic ... restic owns
-/// this" means this call, not a Cradle-side scheduler deciding what to
-/// keep).
+/// references — retention logic belongs to restic, not a Cradle-side
+/// scheduler deciding what to keep.
 pub async fn forget_and_prune(
     destination: &DestinationRecord,
     policy: &RetentionPolicy,

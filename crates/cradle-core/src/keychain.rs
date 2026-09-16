@@ -1,8 +1,8 @@
 //! macOS Keychain access for restic repository passwords.
 //!
-//! Per CLAUDE.md: "Secrets go in the macOS Keychain / Windows DPAPI,
-//! referenced by `credential_ref`. Never store a secret in the database."
-//! Windows DPAPI support lands with M9; this module is macOS-only for now.
+//! Secrets go in the macOS Keychain / Windows DPAPI, referenced by
+//! `credential_ref` — never stored in the database itself. Windows DPAPI
+//! support is a future project; this module is macOS-only for now.
 //!
 //! Deliberately goes through `security-framework` (native `Security.framework`
 //! bindings) rather than shelling out to the `security` CLI: a `security

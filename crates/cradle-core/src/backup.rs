@@ -1,11 +1,10 @@
 //! Runs a `mobilebackup2` backup into the canonical working directory.
 //!
-//! Per CLAUDE.md, `working/<UDID>/` is canonical: it stays exactly in the
-//! state the device left it, because MobileBackup2 computes incrementals
-//! *on the device* by inspecting `Status.plist` / `Manifest.plist` /
-//! `Manifest.db` already sitting there. This module never moves, archives,
-//! or otherwise touches that directory beyond what the protocol itself
-//! writes into it.
+//! `working/<UDID>/` is canonical: it stays exactly in the state the
+//! device left it, because MobileBackup2 computes incrementals *on the
+//! device* by inspecting `Status.plist` / `Manifest.plist` / `Manifest.db`
+//! already sitting there. This module never moves, archives, or otherwise
+//! touches that directory beyond what the protocol itself writes into it.
 //!
 //! The actual transfer is driven by `idevicebackup2` (see
 //! [`crate::libimobiledevice`]) as a subprocess, not the `idevice` Rust
@@ -13,7 +12,7 @@
 //! backup of a real device reliably failed with `MBErrorDomain 104` at a
 //! fixed point (~94%, ~19,000 files), regardless of working directory or
 //! destination volume, while `idevicebackup2` completed the identical
-//! backup cleanly. See `CLAUDE.md`'s Stack section for the full story.
+//! backup cleanly.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,16 +23,16 @@ use crate::libimobiledevice;
 
 /// Receives honest, measurable progress during a backup.
 ///
-/// Per CLAUDE.md: "Every long-running operation reports files done/total,
-/// bytes, rate, ETA, and current domain. Never ship an indeterminate spinner
-/// for an operation whose progress we can measure." Implementations should
-/// be cheap — these are called for every file and every progress tick.
+/// Every long-running operation should report files done/total, bytes,
+/// rate, ETA, and current domain — never ship an indeterminate spinner for
+/// an operation whose progress can be measured. Implementations should be
+/// cheap — these are called for every file and every progress tick.
 ///
 /// `idevicebackup2`'s default output reports files done/total, bytes, and
 /// an overall percentage, but not each file's domain the way the old
 /// `idevice`-backed implementation's typed callback did — that would need
 /// parsing `-d` debug output (raw protocol frames, fragile and versioned to
-/// internals). Accepted trade-off; see `CLAUDE.md`.
+/// internals). Accepted trade-off.
 pub trait ProgressSink: Send + Sync {
     /// `bytes_total` is 0 when the device hasn't reported a batch size yet.
     /// `overall_progress` is the device's own 0.0-100.0 estimate, or
