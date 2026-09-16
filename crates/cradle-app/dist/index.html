@@ -194,7 +194,10 @@
 <div id="app">
   <header>
     <h1>Cradle</h1>
-    <button id="view-toggle" class="quiet">Advanced settings</button>
+    <div style="display:flex; gap:8px;">
+      <button id="help-toggle" class="quiet">Help</button>
+      <button id="view-toggle" class="quiet">Advanced settings</button>
+    </div>
   </header>
   <main>
     <div id="home-view">
@@ -351,6 +354,100 @@
         <div id="dest-form-error" class="result bad" hidden></div>
       </section>
     </div>
+
+    <div id="help-view" hidden>
+      <section class="panel">
+        <h2>How backup works</h2>
+        <p>
+          "Back Up Now" copies everything on your device — Photos, Messages, Health, Notes,
+          Contacts, Keychain-protected data (saved passwords, Wi-Fi networks), and every app's own
+          data — into a folder on this Mac (see "Backup storage location" under Advanced settings).
+          That folder is the one and only copy Cradle keeps locally; there's no separate history of
+          past backups sitting around taking up space.
+        </p>
+        <p>
+          <strong>The first backup of a device is slow; every one after that is fast.</strong> Your
+          iPhone or iPad itself keeps track of what's changed since the last backup and only sends
+          the difference — Cradle doesn't do anything special to make this happen, it's how the
+          device's own backup protocol works. This is also why deleting the local backup (see
+          "Local backups" below) means the next one starts over as a full, slow transfer again.
+        </p>
+        <p>
+          <strong>Backup protection must be turned on before the first backup.</strong> This
+          encrypts the backup with a password you choose, and it's not optional — without it, iOS
+          silently leaves out Keychain items, Health data, call history, and saved Wi-Fi passwords
+          from the backup entirely. Cradle won't let a backup start until this is on.
+        </p>
+        <p>
+          <strong>Every backup is verified afterward</strong> — Cradle checks that the transfer
+          actually finished, that the backup's own internal manifest opens and passes an integrity
+          check, and that every file the manifest expects is really there on disk. A backup that
+          fails this check is never treated as safe to restore from or copy elsewhere, no matter how
+          far the transfer itself got.
+        </p>
+        <p>
+          <strong>"Save a copy to…"</strong> makes an additional copy of an already-verified backup
+          somewhere other than this Mac — an external drive, a NAS, or cloud storage (set up under
+          Advanced settings → Backup copies). This is what actually protects you if this computer is
+          lost, stolen, or its drive fails; the local backup alone doesn't.
+        </p>
+      </section>
+
+      <section class="panel">
+        <h2>How restore works</h2>
+        <p>
+          Restore writes a backup back onto a device — either the same device it came from, or a
+          different one (for example, setting up a replacement iPhone with your old one's data).
+          <strong>It erases everything currently on the target device first.</strong> There's no
+          way to restore only part of a backup or pick and choose what comes back — the underlying
+          device protocol only knows how to restore everything at once.
+        </p>
+        <p>
+          Before anything starts, Cradle checks that the target device is actually ready: it's
+          paired and trusted, Find My is turned off (Settings → [your name] → Find My → Find My
+          iPhone), the target's iOS version isn't older than the backup's, and the target device
+          actually has enough free space for what's about to be written to it. If any of these
+          would clearly fail, restore refuses to start rather than fail partway through.
+        </p>
+        <p>
+          You can restore from the backup already sitting on this Mac, or from a saved copy at one
+          of your archive destinations — useful when the original local backup is gone (a different
+          computer, a wiped drive) but a copy was saved elsewhere. Picking an archived copy lets you
+          choose a specific past point in time, since local backups only ever reflect the most
+          recent state.
+        </p>
+        <p class="status-line" style="margin:10px 0 0;">
+          Restoring onto a device that's still mid-setup (the "Apps &amp; Data" screen during
+          Setup Assistant) can work, but only once the device has gotten far enough through
+          activation for iOS to enable its backup/restore service — pairing succeeding early
+          doesn't guarantee that part is ready yet.
+        </p>
+      </section>
+
+      <section class="panel">
+        <h2>What doesn't come back automatically</h2>
+        <p>
+          <strong>Third-party apps don't reinstall themselves after a restore, and their data may
+          not come back either — this is a real limitation, not a bug Cradle can fix with a
+          setting.</strong> Backups have never contained the actual app files (only Apple's own
+          apps are built into iOS itself), and the mechanism every non-Apple backup tool uses to ask
+          iOS to redownload and reattach the rest has a long-standing, unresolved gap that affects
+          every tool built the same way Cradle is — including the more actively maintained
+          alternatives, and by commercial competitors' own admission in their documentation.
+        </p>
+        <p>
+          In practice: after a restore, expect to see only Apple's own apps at first. Reinstalling a
+          third-party app from the App Store afterward <em>may</em> bring its data back if the app
+          was already installed before the restore ran — but this isn't guaranteed. Everything else
+          — Photos, Messages, Health, Notes, Contacts, Keychain items, and each app's saved data once
+          reinstalled — restores reliably.
+        </p>
+        <p class="status-line" style="margin:10px 0 0;">
+          See the project's README ("Known limitations") for the full technical writeup, including
+          what was actually tested and why this isn't fixable by a flag or a code change.
+        </p>
+      </section>
+    </div>
   </main>
 </div>
 
@@ -495,26 +592,32 @@ function relativeTime(unixSeconds) {
   return new Date(unixSeconds * 1000).toLocaleDateString();
 }
 
-// ---------- View switching (Home / Advanced) ----------
+// ---------- View switching (Home / Advanced / Help) ----------
 
 function setView(view) {
   const home = document.getElementById("home-view");
   const advanced = document.getElementById("advanced-view");
-  const toggle = document.getElementById("view-toggle");
+  const help = document.getElementById("help-view");
+  const advancedToggle = document.getElementById("view-toggle");
+  const helpToggle = document.getElementById("help-toggle");
+
+  home.hidden = view !== "home";
+  advanced.hidden = view !== "advanced";
+  help.hidden = view !== "help";
+  advancedToggle.textContent = view === "advanced" ? "Back to devices" : "Advanced settings";
+  helpToggle.textContent = view === "help" ? "Back to devices" : "Help";
+
   if (view === "advanced") {
-    home.hidden = true;
-    advanced.hidden = false;
-    toggle.textContent = "Back to devices";
     loadLocalBackups();
-  } else {
-    home.hidden = false;
-    advanced.hidden = true;
-    toggle.textContent = "Advanced settings";
   }
 }
 
 document.getElementById("view-toggle").onclick = () => {
   setView(document.getElementById("advanced-view").hidden ? "advanced" : "home");
+};
+
+document.getElementById("help-toggle").onclick = () => {
+  setView(document.getElementById("help-view").hidden ? "help" : "home");
 };
 
 // ---------- Devices (Home view) ----------
